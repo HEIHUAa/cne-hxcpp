@@ -38,7 +38,7 @@ bool FieldMapHas(FieldMap *inMap, const String &inName)
 }
 
 
-#ifdef HXCPP_GC_GENERATIONAL
+#if defined(HXCPP_GC_GENERATIONAL) || defined(HXCPP_GC_INCREMENTAL)
 void FieldMapSet(hx::Object *inThis,FieldMap *inMap, const String &inName, const Dynamic &inValue)
 {
    __string_hash_set(inThis,*inMap, inName, inValue,true);
@@ -261,7 +261,7 @@ hx::Val Anon_obj::__SetField(const String &inName,const hx::Val &inValue, hx::Pr
    int slot = findFixed(inName);
    if (slot>=0)
    {
-      #ifdef HXCPP_GC_GENERATIONAL
+      #if defined(HXCPP_GC_GENERATIONAL) || defined(HXCPP_GC_INCREMENTAL)
       VariantKey *fixed = getFixed() + slot;
       fixed->value=inValue;
       if (fixed->value.type <= cpp::Variant::typeString)

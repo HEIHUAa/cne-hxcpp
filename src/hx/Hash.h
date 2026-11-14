@@ -642,8 +642,18 @@ struct Hash : public HashBase< typename ELEMENT::Key >
       el->next = bucket[hash&mask];
       bucket[hash&mask] = el;
 
-      #ifdef HXCPP_GC_GENERATIONAL
+      #if defined(HXCPP_GC_GENERATIONAL) || defined(HXCPP_GC_INCREMENTAL)
       unsigned char &mark =  ((unsigned char *)(this))[ HX_ENDIAN_MARK_ID_BYTE];
+      #ifdef HXCPP_GC_INCREMENTAL
+      // Incremental marking: any insertion can create a black->white edge
+      // (a fresh String key, or an old key that has not been marked yet).
+      // Record the hash unconditionally; the finishing pass rescans its fields.
+      if (::hx::gIncrementalMarking && mark == hx::gByteMarkID)
+      {
+         mark|=HX_GC_REMEMBERED;
+         (HX_CTX_GET)->pushReferrer(this);
+      }
+      #else
       if (mark == hx::gByteMarkID)
       {
          // Look for nursery objects...
@@ -654,6 +664,7 @@ struct Hash : public HashBase< typename ELEMENT::Key >
             (HX_CTX_GET)->pushReferrer(this);
          }
       }
+      #endif
       #endif
    }
 

@@ -750,7 +750,7 @@ public:
    Array<ELEM_> init(int inIndex, ELEM_ inValue)
    {
       * (ELEM_ *)(mBase + inIndex*sizeof(ELEM_)) = inValue;
-      #ifdef HXCPP_GC_GENERATIONAL
+      #if defined(HXCPP_GC_GENERATIONAL) || defined(HXCPP_GC_INCREMENTAL)
       if (hx::ContainsPointers<ELEM_>())
          { HX_OBJ_WB_GET(this, hx::PointerOf(inValue)); }
       #endif
@@ -758,7 +758,7 @@ public:
    }
 
 
-   #ifdef HXCPP_GC_GENERATIONAL
+   #if defined(HXCPP_GC_GENERATIONAL) || defined(HXCPP_GC_INCREMENTAL)
    inline int pushCtx(hx::StackContext *_hx_ctx, ELEM_ inVal )
    {
       int l = length;
@@ -773,7 +773,7 @@ public:
    // Haxe API
    inline int push( ELEM_ inVal )
    {
-      #ifdef HXCPP_GC_GENERATIONAL
+      #if defined(HXCPP_GC_GENERATIONAL) || defined(HXCPP_GC_INCREMENTAL)
       if (hx::ContainsPointers<ELEM_>())
          return pushCtx(HX_CTX_GET,inVal);
       #endif
@@ -909,7 +909,7 @@ public:
 			inPos = length;
 		hx::ArrayBase::Insert(inPos);
       Item(inPos) = inValue;
-      #ifdef HXCPP_GC_GENERATIONAL
+      #if defined(HXCPP_GC_GENERATIONAL) || defined(HXCPP_GC_INCREMENTAL)
       if (hx::ContainsPointers<ELEM_>())
          { HX_OBJ_WB_GET(this,hx::PointerOf(inValue)); }
       #endif

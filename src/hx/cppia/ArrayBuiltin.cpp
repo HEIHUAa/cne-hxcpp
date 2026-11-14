@@ -119,7 +119,7 @@ struct ArraySetter : public ArrayBuiltinBase
       BCR_CHECK;
       ELEM &elem = thisVal->Item(i);
       FUNC::run(elem, ctx, args[1]);
-      #ifdef HXCPP_GC_GENERATIONAL
+      #if defined(HXCPP_GC_GENERATIONAL) || defined(HXCPP_GC_INCREMENTAL)
       if (hx::ContainsPointers<ELEM>())
          HX_OBJ_WB_CTX(thisVal,hx::PointerOf(elem),ctx);
       #endif
@@ -133,7 +133,7 @@ struct ArraySetter : public ArrayBuiltinBase
       BCR_CHECK;
       ELEM &elem = thisVal->Item(i);
       FUNC::run(elem, ctx, args[1]);
-      #ifdef HXCPP_GC_GENERATIONAL
+      #if defined(HXCPP_GC_GENERATIONAL) || defined(HXCPP_GC_INCREMENTAL)
       if (hx::ContainsPointers<ELEM>())
          HX_OBJ_WB_CTX(thisVal,hx::PointerOf(elem),ctx);
       #endif
@@ -147,7 +147,7 @@ struct ArraySetter : public ArrayBuiltinBase
       BCR_CHECK;
       ELEM &elem = thisVal->Item(i);
       FUNC::run(elem, ctx, args[1]);
-      #ifdef HXCPP_GC_GENERATIONAL
+      #if defined(HXCPP_GC_GENERATIONAL) || defined(HXCPP_GC_INCREMENTAL)
       if (hx::ContainsPointers<ELEM>())
          HX_OBJ_WB_CTX(thisVal,hx::PointerOf(elem),ctx);
       #endif
@@ -161,7 +161,7 @@ struct ArraySetter : public ArrayBuiltinBase
       BCR_CHECK;
       ELEM &elem = thisVal->Item(i);
       FUNC::run(elem, ctx, args[1]);
-      #ifdef HXCPP_GC_GENERATIONAL
+      #if defined(HXCPP_GC_GENERATIONAL) || defined(HXCPP_GC_INCREMENTAL)
       if (hx::ContainsPointers<ELEM>())
          HX_OBJ_WB_CTX(thisVal,hx::PointerOf(elem),ctx);
       #endif
@@ -175,7 +175,7 @@ struct ArraySetter : public ArrayBuiltinBase
       Array_obj<ELEM> *thisVal = reinterpret_cast<Array_obj<ELEM> *>(args[0].obj);
       ELEM &elem = thisVal->Item( args[1].ival );
       FUNC::apply(elem, args[2].ival);
-      #ifdef HXCPP_GC_GENERATIONAL
+      #if defined(HXCPP_GC_GENERATIONAL) || defined(HXCPP_GC_INCREMENTAL)
       if (hx::ContainsPointers<ELEM>())
          HX_OBJ_WB_GET(thisVal,hx::PointerOf(elem));
       #endif
@@ -187,7 +187,7 @@ struct ArraySetter : public ArrayBuiltinBase
       Array_obj<ELEM> *thisVal = reinterpret_cast<Array_obj<ELEM> *>(args[0].obj);
       ELEM &elem = thisVal->Item( args[1].ival );
       FUNC::apply(elem, args[2].dval);
-      #ifdef HXCPP_GC_GENERATIONAL
+      #if defined(HXCPP_GC_GENERATIONAL) || defined(HXCPP_GC_INCREMENTAL)
       if (hx::ContainsPointers<ELEM>())
          HX_OBJ_WB_GET(thisVal,hx::PointerOf(elem));
       #endif
@@ -200,7 +200,7 @@ struct ArraySetter : public ArrayBuiltinBase
       ELEM &elem = thisVal->Item( args[1].ival );
       Dynamic obj(args[2].obj);
       FUNC::apply(elem, obj);
-      #ifdef HXCPP_GC_GENERATIONAL
+      #if defined(HXCPP_GC_GENERATIONAL) || defined(HXCPP_GC_INCREMENTAL)
       if (hx::ContainsPointers<ELEM>())
          HX_OBJ_WB_GET(thisVal,hx::PointerOf(elem));
       #endif
@@ -212,7 +212,7 @@ struct ArraySetter : public ArrayBuiltinBase
       Array_obj<ELEM> *thisVal = reinterpret_cast<Array_obj<ELEM> *>(args[0].obj);
       ELEM &elem = thisVal->Item( args[1].ival );
       FUNC::apply(elem, (* ((String *)(&args[2].sval) )) );
-      #ifdef HXCPP_GC_GENERATIONAL
+      #if defined(HXCPP_GC_GENERATIONAL) || defined(HXCPP_GC_INCREMENTAL)
       if (hx::ContainsPointers<ELEM>())
          HX_OBJ_WB_GET(thisVal,hx::PointerOf(elem));
       #endif
@@ -289,7 +289,7 @@ struct ArraySetter : public ArrayBuiltinBase
          // value = right hand side
 
 
-         #ifdef HXCPP_GC_GENERATIONAL
+         #if defined(HXCPP_GC_GENERATIONAL) || defined(HXCPP_GC_INCREMENTAL)
          if (hx::ContainsPointers<ELEM>())
             compiler->move(sJitTemp2,sJitTemp0.as(jtPointer));
          #endif
@@ -306,7 +306,7 @@ struct ArraySetter : public ArrayBuiltinBase
             compiler->add( sJitTemp0, sJitTemp0.as(jtPointer), sJitTemp1);
             compiler->move( sJitTemp0.star(jtInt), value.as(jtInt) );
             compiler->move( sJitTemp0.star(jtPointer,StringOffset::Ptr), value.as(jtPointer) + StringOffset::Ptr );
-            #ifdef HXCPP_GC_GENERATIONAL
+            #if defined(HXCPP_GC_GENERATIONAL) || defined(HXCPP_GC_INCREMENTAL)
             genWriteBarrier(compiler, sJitTemp2, value.as(jtPointer) + StringOffset::Ptr );
             #endif
          }
@@ -317,7 +317,7 @@ struct ArraySetter : public ArrayBuiltinBase
          else if (sizeof(ELEM)==4)
          {
             compiler->move( sJitTemp0.atReg(sJitTemp1,2), value );
-            #ifdef HXCPP_GC_GENERATIONAL
+            #if defined(HXCPP_GC_GENERATIONAL) || defined(HXCPP_GC_INCREMENTAL)
             if (hx::ContainsPointers<ELEM>())
                genWriteBarrier(compiler, sJitTemp2, value );
             #endif
@@ -325,7 +325,7 @@ struct ArraySetter : public ArrayBuiltinBase
          else if (sizeof(ELEM)==8)
          {
             compiler->move( sJitTemp0.atReg(sJitTemp1,3), value );
-            #ifdef HXCPP_GC_GENERATIONAL
+            #if defined(HXCPP_GC_GENERATIONAL) || defined(HXCPP_GC_INCREMENTAL)
             if (hx::ContainsPointers<ELEM>())
                genWriteBarrier(compiler, sJitTemp2, value );
             #endif
@@ -541,7 +541,7 @@ struct ArrayBuiltin : public ArrayBuiltinBase
          runValue(elem,ctx,args[1]);
          BCR_CHECK;
          thisVal->Item(i) = elem;
-         #ifdef HXCPP_GC_GENERATIONAL
+         #if defined(HXCPP_GC_GENERATIONAL) || defined(HXCPP_GC_INCREMENTAL)
          if (hx::ContainsPointers<ELEM>())
             HX_OBJ_WB_GET(thisVal, hx::PointerOf(elem));
          #endif
@@ -555,7 +555,7 @@ struct ArrayBuiltin : public ArrayBuiltinBase
          BCR_CHECK;
          ELEM &elem = thisVal->Item(idx);
          int result = ValToInt(CREMENT::run(elem));
-         #ifdef HXCPP_GC_GENERATIONAL
+         #if defined(HXCPP_GC_GENERATIONAL) || defined(HXCPP_GC_INCREMENTAL)
          if (hx::ContainsPointers<ELEM>())
            HX_OBJ_WB_CTX(thisVal,hx::PointerOf(elem),ctx);
          #endif
@@ -594,7 +594,7 @@ struct ArrayBuiltin : public ArrayBuiltinBase
          runValue(elem,ctx,args[1]);
          BCR_CHECK;
          thisVal->Item(i) = elem;
-         #ifdef HXCPP_GC_GENERATIONAL
+         #if defined(HXCPP_GC_GENERATIONAL) || defined(HXCPP_GC_INCREMENTAL)
          if (hx::ContainsPointers<ELEM>())
             HX_OBJ_WB_GET(thisVal, hx::PointerOf(elem));
          #endif
@@ -606,7 +606,7 @@ struct ArrayBuiltin : public ArrayBuiltinBase
          ELEM &elem = thisVal->Item(args[0]->runInt(ctx));
 
          Float result = ValToFloat(CREMENT::run(elem));
-         #ifdef HXCPP_GC_GENERATIONAL
+         #if defined(HXCPP_GC_GENERATIONAL) || defined(HXCPP_GC_INCREMENTAL)
          if (hx::ContainsPointers<ELEM>())
            HX_OBJ_WB_CTX(thisVal,hx::PointerOf(elem),ctx);
          #endif
@@ -649,7 +649,7 @@ struct ArrayBuiltin : public ArrayBuiltinBase
          BCR_CHECK;
          ELEM elem;
          runValue(elem,ctx,args[1]);
-         #ifdef HXCPP_GC_GENERATIONAL
+         #if defined(HXCPP_GC_GENERATIONAL) || defined(HXCPP_GC_INCREMENTAL)
          if (hx::ContainsPointers<ELEM>())
             HX_OBJ_WB_GET(thisVal, hx::PointerOf(elem));
          #endif
@@ -664,7 +664,7 @@ struct ArrayBuiltin : public ArrayBuiltinBase
          BCR_CHECK;
          ELEM &elem = thisVal->Item(idx);
          String result = ValToString(CREMENT::run(elem));
-         #ifdef HXCPP_GC_GENERATIONAL
+         #if defined(HXCPP_GC_GENERATIONAL) || defined(HXCPP_GC_INCREMENTAL)
          if (hx::ContainsPointers<ELEM>())
            HX_OBJ_WB_CTX(thisVal,hx::PointerOf(elem),ctx);
          #endif
@@ -711,7 +711,7 @@ struct ArrayBuiltin : public ArrayBuiltinBase
          BCR_CHECK;
          ELEM elem;
          thisVal->Item(i) = runValue(elem,ctx,args[1]);
-         #ifdef HXCPP_GC_GENERATIONAL
+         #if defined(HXCPP_GC_GENERATIONAL) || defined(HXCPP_GC_INCREMENTAL)
          if (hx::ContainsPointers<ELEM>())
             HX_OBJ_WB_GET(thisVal, hx::PointerOf(elem));
          #endif
@@ -725,7 +725,7 @@ struct ArrayBuiltin : public ArrayBuiltinBase
          BCR_CHECK;
          ELEM &elem = thisVal->Item(idx);
          Dynamic result(CREMENT::run(elem));
-         #ifdef HXCPP_GC_GENERATIONAL
+         #if defined(HXCPP_GC_GENERATIONAL) || defined(HXCPP_GC_INCREMENTAL)
          if (hx::ContainsPointers<ELEM>())
            HX_OBJ_WB_CTX(thisVal,hx::PointerOf(elem),ctx);
          #endif
@@ -848,7 +848,7 @@ struct ArrayBuiltin : public ArrayBuiltinBase
          BCR_VCHECK;
          ELEM elem;
          thisVal->Item(i) = runValue(elem,ctx,args[1]);
-         #ifdef HXCPP_GC_GENERATIONAL
+         #if defined(HXCPP_GC_GENERATIONAL) || defined(HXCPP_GC_INCREMENTAL)
          if (hx::ContainsPointers<ELEM>())
             HX_OBJ_WB_CTX(thisVal, hx::PointerOf(elem), ctx);
          #endif
@@ -862,7 +862,7 @@ struct ArrayBuiltin : public ArrayBuiltinBase
          BCR_VCHECK;
          ELEM &elem = thisVal->Item(idx);
          CREMENT::run(elem);
-         #ifdef HXCPP_GC_GENERATIONAL
+         #if defined(HXCPP_GC_GENERATIONAL) || defined(HXCPP_GC_INCREMENTAL)
          if (hx::ContainsPointers<ELEM>())
            HX_OBJ_WB_CTX(thisVal,hx::PointerOf(elem),ctx);
          #endif
@@ -1054,7 +1054,7 @@ struct ArrayBuiltin : public ArrayBuiltinBase
    {
       ELEM &t = Array<ELEM>(inArray)[inIndex];
       CREMENT::run(t);
-      #ifdef HXCPP_GC_GENERATIONAL
+      #if defined(HXCPP_GC_GENERATIONAL) || defined(HXCPP_GC_INCREMENTAL)
       if (hx::ContainsPointers<ELEM>())
          HX_OBJ_WB_GET(inArray,hx::PointerOf(t));
       #endif
@@ -1064,7 +1064,7 @@ struct ArrayBuiltin : public ArrayBuiltinBase
    {
       ELEM &t = Array<ELEM>(inArray)[inIndex];
       int result =  ValToInt( CREMENT::run(t) );
-      #ifdef HXCPP_GC_GENERATIONAL
+      #if defined(HXCPP_GC_GENERATIONAL) || defined(HXCPP_GC_INCREMENTAL)
       if (hx::ContainsPointers<ELEM>())
          HX_OBJ_WB_GET(inArray,hx::PointerOf(t));
       #endif
@@ -1075,7 +1075,7 @@ struct ArrayBuiltin : public ArrayBuiltinBase
    {
       ELEM &t = Array<ELEM>(inArray)[inIndex];
       *d = ValToFloat( CREMENT::run(t) );
-      #ifdef HXCPP_GC_GENERATIONAL
+      #if defined(HXCPP_GC_GENERATIONAL) || defined(HXCPP_GC_INCREMENTAL)
       if (hx::ContainsPointers<ELEM>())
          HX_OBJ_WB_GET(inArray,hx::PointerOf(t));
       #endif
@@ -1086,7 +1086,7 @@ struct ArrayBuiltin : public ArrayBuiltinBase
    {
       ELEM &t = Array<ELEM>(inArray)[inIndex];
       Dynamic result( CREMENT::run(t) );
-      #ifdef HXCPP_GC_GENERATIONAL
+      #if defined(HXCPP_GC_GENERATIONAL) || defined(HXCPP_GC_INCREMENTAL)
       if (hx::ContainsPointers<ELEM>())
          HX_OBJ_WB_GET(inArray,hx::PointerOf(t));
       #endif
@@ -1255,7 +1255,7 @@ struct ArrayBuiltin : public ArrayBuiltinBase
                if (destType!=etVoid)
                   compiler->add(length, sJitTemp0, (int)1 );
 
-               #ifdef HXCPP_GC_GENERATIONAL
+               #if defined(HXCPP_GC_GENERATIONAL) || defined(HXCPP_GC_INCREMENTAL)
                if (hx::ContainsPointers<ELEM>())
                   compiler->move(sJitTemp2, sJitTemp1.as(jtPointer));
                #endif
@@ -1274,7 +1274,7 @@ struct ArrayBuiltin : public ArrayBuiltinBase
 
                   compiler->move( sJitTemp0.star(jtInt), tempVal.as(jtInt) );
                   compiler->move( sJitTemp0.star(jtPointer,StringOffset::Ptr), tempVal.as(jtPointer) + StringOffset::Ptr );
-                  #ifdef HXCPP_GC_GENERATIONAL
+                  #if defined(HXCPP_GC_GENERATIONAL) || defined(HXCPP_GC_INCREMENTAL)
                   genWriteBarrier(compiler, sJitTemp2, tempVal.as(jtPointer) + StringOffset::Ptr );
                   #endif
                }
@@ -1285,7 +1285,7 @@ struct ArrayBuiltin : public ArrayBuiltinBase
                else if (sizeof(ELEM)==4)
                {
                   compiler->move( sJitTemp1.atReg(sJitTemp0,2), tempVal );
-                  #ifdef HXCPP_GC_GENERATIONAL
+                  #if defined(HXCPP_GC_GENERATIONAL) || defined(HXCPP_GC_INCREMENTAL)
                   if (hx::ContainsPointers<ELEM>())
                      genWriteBarrier(compiler, sJitTemp2, tempVal );
                   #endif
@@ -1293,7 +1293,7 @@ struct ArrayBuiltin : public ArrayBuiltinBase
                else if (sizeof(ELEM)==8)
                {
                   compiler->move( sJitTemp1.atReg(sJitTemp0,3), tempVal );
-                  #ifdef HXCPP_GC_GENERATIONAL
+                  #if defined(HXCPP_GC_GENERATIONAL) || defined(HXCPP_GC_INCREMENTAL)
                   if (hx::ContainsPointers<ELEM>())
                      genWriteBarrier(compiler, sJitTemp2, tempVal );
                   #endif
@@ -1349,7 +1349,7 @@ struct ArrayBuiltin : public ArrayBuiltinBase
                //  length, alloc have been checked
 
 
-               #ifdef HXCPP_GC_GENERATIONAL
+               #if defined(HXCPP_GC_GENERATIONAL) || defined(HXCPP_GC_INCREMENTAL)
                if (hx::ContainsPointers<ELEM>())
                    compiler->move(sJitTemp2,sJitTemp0.as(jtPointer));
                #endif
@@ -1371,7 +1371,7 @@ struct ArrayBuiltin : public ArrayBuiltinBase
                   compiler->move( sJitTemp0.star(jtInt), tempVal.as(jtInt) );
                   compiler->move( sJitTemp0.star(jtPointer, StringOffset::Ptr), tempVal.as(jtPointer) + StringOffset::Ptr );
 
-                  #ifdef HXCPP_GC_GENERATIONAL
+                  #if defined(HXCPP_GC_GENERATIONAL) || defined(HXCPP_GC_INCREMENTAL)
                   genWriteBarrier(compiler, sJitTemp2, tempVal.as(jtPointer) + StringOffset::Ptr );
                   #endif
 
@@ -1387,7 +1387,7 @@ struct ArrayBuiltin : public ArrayBuiltinBase
                else if (sizeof(ELEM)==4)
                {
                   compiler->move( sJitTemp0.atReg(sJitTemp1,2), tempVal );
-                  #ifdef HXCPP_GC_GENERATIONAL
+                  #if defined(HXCPP_GC_GENERATIONAL) || defined(HXCPP_GC_INCREMENTAL)
                   if (hx::ContainsPointers<ELEM>())
                      genWriteBarrier(compiler, sJitTemp2, tempVal );
                   #endif
@@ -1397,7 +1397,7 @@ struct ArrayBuiltin : public ArrayBuiltinBase
                else if (sizeof(ELEM)==8)
                {
                   compiler->move( sJitTemp0.atReg(sJitTemp1,3), tempVal );
-                  #ifdef HXCPP_GC_GENERATIONAL
+                  #if defined(HXCPP_GC_GENERATIONAL) || defined(HXCPP_GC_INCREMENTAL)
                   if (hx::ContainsPointers<ELEM>())
                      genWriteBarrier(compiler, sJitTemp2, tempVal );
                   #endif

@@ -431,7 +431,7 @@ struct StackContext : public hx::ImmixAllocator
    WeakStringSet *stringSet;
    #endif
 
-   #ifdef HXCPP_GC_GENERATIONAL
+   #if defined(HXCPP_GC_GENERATIONAL) || defined(HXCPP_GC_INCREMENTAL)
    MarkChunk *mOldReferrers;
    inline void pushReferrer(hx::Object *inObj)
    {

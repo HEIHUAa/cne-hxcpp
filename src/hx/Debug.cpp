@@ -189,6 +189,10 @@ String FormatStack(const char *file, const char *clazz, const char *func, int li
 
 StackContext::StackContext()
 {
+   #if defined(HXCPP_GC_GENERATIONAL) || defined(HXCPP_GC_INCREMENTAL)
+   mOldReferrers = 0;
+   #endif
+
    #ifdef HXCPP_STACK_TRACE
    mIsUnwindingException = false;
    #endif

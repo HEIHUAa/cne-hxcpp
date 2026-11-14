@@ -70,7 +70,7 @@ class HXCPP_EXTERN_CLASS_ATTRIBUTES EnumBase_obj : public hx::Object
       template<typename T>
       inline EnumBase_obj *_hx_init(int inIndex,const T &inValue)
       {
-         #ifdef HXCPP_GC_GENERATIONAL
+         #if defined(HXCPP_GC_GENERATIONAL) || defined(HXCPP_GC_INCREMENTAL)
          cpp::Variant &v = _hx_getFixed()[inIndex];
          v = inValue;
          if (v.type<=cpp::Variant::typeString)

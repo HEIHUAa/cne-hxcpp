@@ -110,7 +110,7 @@ static  ::Dynamic Create##enum_obj(::String inName,::hx::DynamicArray inArgs) \
 #define HX_CHECK_DYNAMIC_GET_INT_FIELD(inID) \
    {  ::Dynamic d;  if (::hx::FieldMapGet(&__mDynamicFields,inID,d)) return d; }
 
-#ifdef HXCPP_GC_GENERATIONAL
+#if defined(HXCPP_GC_GENERATIONAL) || defined(HXCPP_GC_INCREMENTAL)
 #define HX_DYNAMIC_SET_FIELD(inName,inValue) ::hx::FieldMapSet(this,&__mDynamicFields,inName,inValue)
 #else
 #define HX_DYNAMIC_SET_FIELD(inName,inValue) ::hx::FieldMapSet(&__mDynamicFields,inName,inValue)

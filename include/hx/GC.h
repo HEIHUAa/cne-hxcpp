@@ -1,6 +1,19 @@
 #ifndef HX_GC_H
 #define HX_GC_H
 
+// Write barriers are emitted by the Haxe generator into the _hx_set_ accessors
+// regardless of the GC mode; they expand through the macros below.  A leftover
+// generational define would switch the whole runtime into a different marking
+// scheme, so make sure it is off here.
+#ifdef HXCPP_GC_GENERATIONAL
+#undef HXCPP_GC_GENERATIONAL
+#endif
+
+// Incremental marking: keeps the write barrier compiled in and gives
+// hx::StackContext its remembered-referrer chunk.  The barrier is inert until
+// an incremental cycle actually starts (gIncrementalMarking).
+#define HXCPP_GC_INCREMENTAL
+
 #include <hx/Tls.h>
 #include <stdio.h>
 
@@ -39,6 +52,16 @@ HXCPP_EXTERN_CLASS_ATTRIBUTES double __hxcpp_gc_mem_info(int inWhat);
 HXCPP_EXTERN_CLASS_ATTRIBUTES void  __hxcpp_enter_gc_free_zone();
 HXCPP_EXTERN_CLASS_ATTRIBUTES void  __hxcpp_exit_gc_free_zone();
 HXCPP_EXTERN_CLASS_ATTRIBUTES void  __hxcpp_gc_safe_point();
+// Frame-driven collection scheduling.  Call once per frame from the main thread.
+// Returns true when a collection is running.  The pacer derives its own
+// per-frame work budget from the recent frame times; inBudgetMicros > 0
+// overrides that budget and inFrameMs feeds the frame-time average.  Pass 0
+// for inFrameMs when the frame time is unknown.
+HXCPP_EXTERN_CLASS_ATTRIBUTES bool  __hxcpp_gc_frame_tick(int inBudgetMicros, bool inAllowFull, double inFrameMs);
+// Current heap pressure (used bytes / target working memory).
+HXCPP_EXTERN_CLASS_ATTRIBUTES double __hxcpp_gc_frame_pressure();
+// Minimum number of frames between two frame-driven collections.
+HXCPP_EXTERN_CLASS_ATTRIBUTES void  __hxcpp_gc_set_frame_interval(int inMinFrames);
 HXCPP_EXTERN_CLASS_ATTRIBUTES void  __hxcpp_spam_collects(int inEveryNCalls);
 HXCPP_EXTERN_CLASS_ATTRIBUTES void  __hxcpp_set_minimum_working_memory(int inBytes);
 HXCPP_EXTERN_CLASS_ATTRIBUTES void  __hxcpp_set_minimum_free_space(int inBytes);
@@ -168,6 +191,8 @@ extern int sgTargetFreeSpacePercentage;
 
 
 extern HXCPP_EXTERN_CLASS_ATTRIBUTES int gByteMarkID;
+// True while an incremental marking cycle is in progress (mutator running).
+extern HXCPP_EXTERN_CLASS_ATTRIBUTES volatile bool gIncrementalMarking;
 
 // Call in response to a gPauseForCollect. Normally, this is done for you in "new"
 void PauseForCollect();
@@ -471,6 +496,26 @@ typedef ImmixAllocator Ctx;
   #define HX_OBJ_WB_NEW_MARKED_OBJECT(obj) { \
      if (((unsigned char *)(obj))[ HX_ENDIAN_MARK_ID_BYTE]==::hx::gByteMarkID) ::hx::NewMarkedObject(obj); \
   }
+#elif defined(HXCPP_GC_INCREMENTAL)
+  // Incremental marking: only record while a cycle is running.  Outside a
+  // cycle the barrier is a single predictable branch.
+  #define HX_OBJ_WB_CTX(obj,value,ctx) { \
+        if (::hx::gIncrementalMarking) { \
+           unsigned char &mark =  ((unsigned char *)(obj))[ HX_ENDIAN_MARK_ID_BYTE]; \
+           if (mark == ::hx::gByteMarkID && value && (((unsigned char *)(value))[ HX_ENDIAN_MARK_ID_BYTE  ] != ::hx::gByteMarkID) ) { \
+               mark|=HX_GC_REMEMBERED; \
+               ctx->pushReferrer(obj); \
+           } \
+        } }
+  #define HX_OBJ_WB_PESSIMISTIC_CTX(obj,ctx) { \
+        if (::hx::gIncrementalMarking) { \
+           unsigned char &mark =  ((unsigned char *)(obj))[ HX_ENDIAN_MARK_ID_BYTE]; \
+           if (mark == ::hx::gByteMarkID)  { \
+              mark|=HX_GC_REMEMBERED; \
+              ctx->pushReferrer(obj); \
+           } \
+        } }
+  #define HX_OBJ_WB_NEW_MARKED_OBJECT(obj)
 #else
   #define HX_OBJ_WB_CTX(obj,value,ctx)
   #define HX_OBJ_WB_PESSIMISTIC_CTX(obj,ctx)

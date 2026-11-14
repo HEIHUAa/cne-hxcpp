@@ -97,7 +97,7 @@ ScriptCallable::ScriptCallable(CppiaModule &inModule,ScriptNamedFunction *inFunc
    const char *signature = inFunction->signature;
    int argCount = strlen(signature)-1;
    if (argCount<0)
-      throw "ScriptNamedFunction: Invalid arg count";
+      hx::Throw("ScriptNamedFunction: Invalid arg count");
 
    args.resize(argCount);
    hasDefault.resize(argCount);
@@ -128,7 +128,7 @@ ScriptCallable::ScriptCallable(CppiaModule &inModule,ScriptNamedFunction *inFunc
             arg.storeType = fsObject;
             break;
          default:
-            throw "Bad haxe signature";
+            hx::Throw("Bad haxe signature");
       }
    }
    body = new RelayExpr(inFunction->execute);
@@ -836,7 +836,7 @@ public:
 
       int haveArgs = !inArgs.mPtr ? 0 : inArgs->length;
       if (haveArgs>function->argCount)
-         throw sInvalidArgCount;
+         hx::Throw(sInvalidArgCount);
 
       for(int a=0; a<haveArgs; a++)
          pushArgDynamic(ctx,a,inArgs[a]);

@@ -1719,7 +1719,7 @@ struct CallHaxe : public CppiaExpr
    CppiaExpr *link(CppiaModule &inModule) HXCPP_OVERRIDE
    {
       if (strlen(function.signature) != args.size()+1)
-         throw "CallHaxe: Invalid arg count";
+         hx::Throw("CallHaxe: Invalid arg count");
       for(int i=0;i<args.size()+1;i++)
       {
          switch(function.signature[i])
@@ -1731,7 +1731,7 @@ struct CallHaxe : public CppiaExpr
                   break;
                // fallthough
             default:
-               throw "Bad haxe signature";
+               hx::Throw("Bad haxe signature");
          }
       }
       switch(function.signature[0])
@@ -3835,7 +3835,7 @@ inline static void * getPointerFrom(T *) { return 0; }
 inline static void * getPointerFrom(hx::Object **o) { return *o; }
 inline static void * getPointerFrom(String *s) { return (void *)s->raw_ptr(); }
 
-#ifdef HXCPP_GC_GENERATIONAL
+#if defined(HXCPP_GC_GENERATIONAL) || defined(HXCPP_GC_INCREMENTAL)
   #define MEM_WB_CHECK \
      if (isPointerObject(t)) {\
         if (REFMODE==locThis) { \
@@ -3852,7 +3852,7 @@ inline static void * getPointerFrom(String *s) { return (void *)s->raw_ptr(); }
   #define MEM_WB_CHECK
 #endif
 
-#if defined(HXCPP_GC_GENERATIONAL) && defined(CPPIA_JIT)
+#if (defined(HXCPP_GC_GENERATIONAL) || defined(HXCPP_GC_INCREMENTAL)) && defined(CPPIA_JIT)
 static void SLJIT_CALL pushWriteBarrier(hx::StackContext *inCtx, hx::Object *inObj)
 {
    unsigned char &mark =  ((unsigned char *)(inObj))[ HX_ENDIAN_MARK_ID_BYTE];
@@ -3996,7 +3996,7 @@ struct MemReferenceSetter : public CppiaExpr
 
             compiler->move( sJitTemp2.star(targetType) + offset, tmpVal );
 
-            #ifdef HXCPP_GC_GENERATIONAL
+            #if defined(HXCPP_GC_GENERATIONAL) || defined(HXCPP_GC_INCREMENTAL)
             if (isPointerObject((T*)0))
                genWriteBarrier(compiler, sJitTemp2, (tmpVal + ((targetType==jtString ? StringOffset::Ptr : 0))).as(jtPointer) );
             #endif
@@ -4024,7 +4024,7 @@ struct MemReferenceSetter : public CppiaExpr
                {
                   value->genCode(compiler, target, getType());
 
-                  #ifdef HXCPP_GC_GENERATIONAL
+                  #if defined(HXCPP_GC_GENERATIONAL) || defined(HXCPP_GC_INCREMENTAL)
                   if (REFMODE==locThis && isPointerObject((T*)0))
                      genWriteBarrier(compiler, sJitThis, targetType==jtString ? (target+StringOffset::Ptr).as(jtPointer) : target );
                   #endif
@@ -4147,7 +4147,7 @@ static hx::Object * SLJIT_CALL objPreDec(hx::Object **ioVal)
    return *ioVal;
 }
 
-#ifdef HXCPP_GC_GENERATIONAL
+#if defined(HXCPP_GC_GENERATIONAL) || defined(HXCPP_GC_INCREMENTAL)
 static void SLJIT_CALL objDecWb(hx::Object *inObj,int inOffset)
 {
    hx::Object ** ioVal = (hx::Object **)( (char *)inObj + inOffset );
@@ -4362,7 +4362,7 @@ struct MemReferenceCrement : public CppiaExpr
             break;
 
          case etObject:
-            #ifdef HXCPP_GC_GENERATIONAL
+            #if defined(HXCPP_GC_GENERATIONAL) || defined(HXCPP_GC_INCREMENTAL)
             if (REFMODE==locObj || REFMODE==locThis)
             {
                JitVal obj = REFMODE==locThis ? sJitThis.as(jtPointer) : sJitTemp0.as(jtPointer);
@@ -5155,7 +5155,7 @@ struct ArrayDef : public CppiaDynamicExpr
                items[i]->genCode(compiler, sJitTemp0, etObject );
                compiler->move(sJitTemp1, arrayPtr);
                compiler->move(sJitTemp1.star(jtPointer)+i*sizeof(void *), sJitTemp0.as(jtPointer));
-               #ifdef HXCPP_GC_GENERATIONAL
+               #if defined(HXCPP_GC_GENERATIONAL) || defined(HXCPP_GC_INCREMENTAL)
                compiler->move(sJitTemp2, array);
                genWriteBarrier(compiler, sJitTemp2, sJitTemp0 );
                #endif
@@ -5184,7 +5184,7 @@ struct ArrayDef : public CppiaDynamicExpr
                compiler->move(sJitTemp1, arrayPtr);
                compiler->move(sJitTemp1.star(jtInt)+i*sizeof(String), val.as(jtInt));
                compiler->move(sJitTemp1.star(jtPointer)+i*sizeof(String)+StringOffset::Ptr, val.as(jtPointer) + StringOffset::Ptr );
-               #ifdef HXCPP_GC_GENERATIONAL
+               #if defined(HXCPP_GC_GENERATIONAL) || defined(HXCPP_GC_INCREMENTAL)
                compiler->move(sJitTemp0, array);
                genWriteBarrier(compiler, sJitTemp0, val.as(jtPointer) + StringOffset::Ptr);
                #endif

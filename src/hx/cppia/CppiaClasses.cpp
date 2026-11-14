@@ -589,7 +589,7 @@ bool CppiaClassInfo::setField(hx::Object *inThis, String inName, Dynamic inValue
                         inThis->__GetFieldMap();
    if (map)
    {
-      #ifdef HXCPP_GC_GENERATIONAL
+      #if defined(HXCPP_GC_GENERATIONAL) || defined(HXCPP_GC_INCREMENTAL)
       FieldMapSet(inThis,map, inName, inValue);
       #else
       FieldMapSet(map, inName, inValue);
