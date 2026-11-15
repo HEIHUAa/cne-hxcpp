@@ -1,4 +1,4 @@
-﻿#include <hxcpp.h>
+#include <hxcpp.h>
 
 #include <hx/GC.h>
 #include <hx/Memory.h>
@@ -175,19 +175,22 @@ static void GCPerfLog(const char *inFormat, ...)
 }
 
 // A single collection can drop thousands of large objects, and free() of the
-// big blocks alone cost up to ~25ms in gc_perf.log.  Hand them to a worker so
-// the collection itself only pays the queue push.
+// big blocks alone cost up to ~25ms in gc_perf.log.  Empty block groups are
+// the same story: releasing hundreds of MB through HxFreeGCBlock (VirtualFree)
+// took ~37ms inside the pause.  Hand both to a worker so the collection
+// itself only pays the queue push.
+struct GCDeferredFree { void *ptr; bool isBlock; };
 static std::mutex                  sgFreeLock;
 static std::condition_variable     sgFreeCv;
-static std::vector<unsigned int *> sgFreeQueue;
+static std::vector<GCDeferredFree> sgFreeQueue;
 static std::thread                *sgFreeThread = 0;
 static bool                        sgFreeQuit = false;
 
-static void LargeFreeThreadProc()
+static void GCDeferredFreeThreadProc()
 {
    while(true)
    {
-      std::vector<unsigned int *> batch;
+      std::vector<GCDeferredFree> batch;
       {
          std::unique_lock<std::mutex> l(sgFreeLock);
          sgFreeCv.wait(l, [](){ return !sgFreeQueue.empty() || sgFreeQuit; });
@@ -196,22 +199,43 @@ static void LargeFreeThreadProc()
          batch.swap(sgFreeQueue);
       }
       for(size_t i=0;i<batch.size();i++)
-         HxFree(batch[i]);
+      {
+         if (batch[i].isBlock)
+            HxFreeGCBlock(batch[i].ptr);
+         else
+            HxFree(batch[i].ptr);
+      }
    }
+}
+
+static void QueueGCFree(void *inPtr, bool inIsBlock)
+{
+   {
+      std::lock_guard<std::mutex> l(sgFreeLock);
+      GCDeferredFree item;
+      item.ptr = inPtr;
+      item.isBlock = inIsBlock;
+      sgFreeQueue.push_back(item);
+   }
+   if (!sgFreeThread)
+   {
+      sgFreeThread = new std::thread(GCDeferredFreeThreadProc);
+      sgFreeThread->detach();
+   }
+   sgFreeCv.notify_one();
 }
 
 static void QueueLargeFree(unsigned int *inBlob)
 {
-   {
-      std::lock_guard<std::mutex> l(sgFreeLock);
-      sgFreeQueue.push_back(inBlob);
-   }
-   if (!sgFreeThread)
-   {
-      sgFreeThread = new std::thread(LargeFreeThreadProc);
-      sgFreeThread->detach();
-   }
-   sgFreeCv.notify_one();
+   QueueGCFree(inBlob, false);
+}
+
+// Block groups are not touched by anything once their GroupInfo.alloc is
+// cleared and the block list is rebuilt, so the OS release can happen
+// whenever the worker gets to it.
+static void QueueBlockGroupFree(void *inGroup)
+{
+   QueueGCFree(inGroup, true);
 }
 
 namespace hx
@@ -814,6 +838,8 @@ enum ThreadPoolJob
    tpjAsyncZeroJit,
    tpjGetStats,
    tpjVisitBlocks,
+   tpjClearRowMarks,
+   tpjStackScan,
 };
 
 int sgThreadCount = 0;
@@ -1730,6 +1756,18 @@ struct GlobalChunks
       processListPopLock = 0;
    }
 
+   // Diagnostics: work that survived a "drain the world" point means a
+   // marking thread dropped it (split-job race) - the entries never get
+   // marked, the sweep frees them and the owner is left with dangling
+   // pointers.  Checked after every STW drain.
+   int pendingJobs()
+   {
+      int n = 0;
+      for(MarkChunk *c = (MarkChunk *)processList; c; c = c->next)
+         n++;
+      return n;
+   }
+
    MarkChunk *pushJobNoWake(MarkChunk *inChunk)
    {
       while(true)
@@ -1757,7 +1795,11 @@ struct GlobalChunks
       _hx_atomic_add(&sThreadChunkPushCount, 1);
       #endif
 
-      if (MAX_GC_THREADS>1 && sLazyThreads)
+      // Wake check runs unconditionally (a stale sLazyThreads here would miss
+      // a thread that just completed, orphaning this job - see the final
+      // processList re-check in popJobOrFinish).  Waking when nobody sleeps
+      // is a cheap no-op: SignalThreadPool only notifies sleepers.
+      if (MAX_GC_THREADS>1)
       {
          std::lock_guard<std::mutex> l(sThreadPoolLock);
 
@@ -1934,6 +1976,17 @@ struct GlobalChunks
                }
             }
             std::lock_guard<std::mutex> l(sThreadPoolLock);
+            // Last chance before completing: a worker may have pushed a split
+            // job (takeArrayJob) between the unlocked spin check and this
+            // lock.  Taking the job here keeps it from being orphaned - an
+            // unprocessed range means unmarked objects, which the next sweep
+            // frees while the owning array keeps the dangling pointers.
+            if (processList && !sgThreadPoolAbort)
+            {
+               result = popJobLocked(0);
+               if (result)
+                  return result;
+            }
             completeThreadLocked(inThreadId);
          }
          return result;
@@ -2130,6 +2183,15 @@ public:
              if (sgThreadPoolAbort)
              {
                 releaseJobs();
+                // Mirror popJobOrFinish's bookkeeping: without completing the
+                // thread here it would go back to waitForThreadWake with its
+                // sRunningThreads bit still set, and StopThreadJobs would wait
+                // for it forever (the major-abort hang in gc_perf.log).
+                if (mThreadId>=0 && sAllThreads)
+                {
+                   std::lock_guard<std::mutex> l(sThreadPoolLock);
+                   sGlobalChunks.completeThreadLocked(mThreadId);
+                }
                 return;
              }
              #endif
@@ -2194,6 +2256,13 @@ public:
              if (sgThreadPoolAbort)
              {
                 releaseJobs();
+                // Same bookkeeping as processMarkStack's abort exit: the pool
+                // thread must complete or StopThreadJobs waits forever.
+                if (mThreadId>=0 && sAllThreads)
+                {
+                   std::lock_guard<std::mutex> l(sThreadPoolLock);
+                   sGlobalChunks.completeThreadLocked(mThreadId);
+                }
                 return true;
              }
              #endif
@@ -3013,7 +3082,6 @@ void RunFinalizers()
 
       i = next;
    }
-
    MEM_STAMP(hx::tFinalizers);
 
    for(ObjectIdMap::iterator i=sObjectIdMap.begin(); i!=sObjectIdMap.end(); )
@@ -3941,17 +4009,22 @@ public:
          return;
 
       size_t liveRows = LiveBytes() >> IMMIX_LINE_BITS;
-      // Three quarters of the heap target.  MMTk's ConcurrentImmix uses half,
-      // but a game prefers fewer cycles: the pause per cycle is already ~1ms
-      // and the marker still has a quarter of the heap (tens of MB) to finish
-      // concurrently.  Scaling by live made the trigger shrink whenever live
-      // dropped, which started cycles every ~12MB during play.
-      size_t thresholdRows = (sWorkingMemorySize - (sWorkingMemorySize >> 2)) >> IMMIX_LINE_BITS;
+      // MMTk's ConcurrentImmix trigger: start the cycle when half of the
+      // FREE heap capacity has been consumed, so the concurrent marker
+      // always has the other half as headroom.  Tying the threshold to
+      // sWorkingMemorySize (which the target-free-space percentage inflates
+      // to live*5) started cycles far too late: the mutator ran out of
+      // usable holes and every cycle ended in a fragmentation abort.
+      size_t capRows = GetWorkingMemory() >> IMMIX_LINE_BITS;
+      // 75% of the free capacity: at 1000fps the mutator burns the remaining
+      // quarter in well under a second (the marker finishes the live set in
+      // about that time), and a fragmentation miss now costs a ~2ms
+      // frag-finish instead of a full stop-the-world collect, so the extra
+      // headroom is worth more than the insurance.
+      size_t thresholdRows = liveRows + (((capRows - liveRows) * 3) >> 2);
       size_t minRows = (size_t)(8<<20) >> IMMIX_LINE_BITS;
       if (thresholdRows < minRows)
          thresholdRows = minRows;
-      if (liveRows > thresholdRows)
-         thresholdRows = liveRows;
       if (sRowsSinceCycle < thresholdRows)
          return;
 
@@ -4013,7 +4086,14 @@ public:
          if (growLimit > growCap)
             growLimit = growCap;
          bool incrementalGrow = hx::gIncrementalMarking && GetWorkingMemory()<growLimit;
-         if (!result && allowMoreBlocks() && (!sgInternalEnable || incrementalGrow || GetWorkingMemory()<sWorkingMemorySize))
+         // GC-disabled loads used to grow without any bound here (a 3GB song
+         // pushed the block heap to 2GB), and every later full collect then
+         // had to scan all of it.  Keep the "no collects while disabled"
+         // contract but bound the growth; past the bound a collect runs and
+         // the shrink hands the memory back.
+         bool disabledGrow = !sgInternalEnable &&
+            GetWorkingMemory() < sWorkingMemorySize*2 + (256<<20);
+         if (!result && allowMoreBlocks() && (disabledGrow || incrementalGrow || GetWorkingMemory()<sWorkingMemorySize))
          {
             if (AllocMoreBlocks(forceCompact,false))
                result = GetNextFree(inRequiredBytes);
@@ -4042,11 +4122,30 @@ public:
          if (!result && sgIncrementalActive)
          {
             // Fragmented: every block has a hole smaller than the request, so
-            // no amount of growing helps.  End the cycle and let a full
-            // collection rebuild the free lists.
-            AbortIncremental();
-            inAlloc->SetupStackAndCollect(false,true,true,true);
-            result = GetNextFree(inRequiredBytes);
+            // no amount of growing helps.  If the concurrent mark is already
+            // done, closing the cycle now (a ~2ms finish pause) starts the
+            // lazy sweep and reclaims the garbage WITHOUT the full
+            // stop-the-world collect the old abort paid for (28-43ms in the
+            // big-song log).  Only an unfinished mark falls back to the
+            // abort, because waiting for it would stall the allocator.
+            if (BackgroundMarkFinished())
+            {
+               GCPerfLog("incr-frag-finish size=%d blocks=%d free=%d wm=%d target=%d",
+                  inRequiredBytes, (int)mAllBlocks.size(), (int)mFreeBlocks.size(),
+                  (int)GetWorkingMemory(), (int)sWorkingMemorySize);
+               FinishIncremental();
+               while (!result && SweepOneBlock())
+                  result = GetNextFree(inRequiredBytes);
+            }
+            if (!result)
+            {
+               GCPerfLog("incr-abort-frag size=%d blocks=%d free=%d wm=%d target=%d",
+                  inRequiredBytes, (int)mAllBlocks.size(), (int)mFreeBlocks.size(),
+                  (int)GetWorkingMemory(), (int)sWorkingMemorySize);
+               AbortIncremental();
+               inAlloc->SetupStackAndCollect(false,true,true,true);
+               result = GetNextFree(inRequiredBytes);
+            }
          }
 
          if (!result)
@@ -4522,7 +4621,10 @@ public:
          if (g.alloc && g.isEmpty && !g.pinned)
          {
             size_t bytes = g.blocks << IMMIX_BLOCK_BITS;
-            HxFreeGCBlock(g.alloc);
+            // Async OS release: VirtualFree of hundreds of MB measured tens of
+            // ms inside this pause (gc_perf.log "stats" time).  Nothing below
+            // references the group memory any more.
+            QueueBlockGroupFree(g.alloc);
             g.alloc = 0;
             released += bytes;
          }
@@ -4817,7 +4919,42 @@ public:
       }
    }
 
-  
+   void ClearRowMarksAsync()
+   {
+      while(!sgThreadPoolAbort)
+      {
+         int blockId = _hx_atomic_add(&mThreadJobId, 1);
+         if (blockId>=mAllBlocks.size())
+            break;
+
+         mAllBlocks[blockId]->clearRowMarks();
+      }
+   }
+
+   // Finish-phase root scan: each worker conservative-scans the captured
+   // stacks/registers of the paused mutator threads.  The captured state is
+   // frozen (all mutators are parked at a safepoint) and each worker's
+   // MarkContext keeps its pushes thread-local until releaseJobs publishes
+   // them for the mark drain.
+   void StackScanAsync(hx::MarkContext &inCtx)
+   {
+      // The previous drain released this context's chunk (marking==0) - the
+      // main thread's mMarker always re-arms via init() before marking, and
+      // so must a pool context before any direct pushObj.
+      inCtx.init();
+      while(!sgThreadPoolAbort)
+      {
+         int allocId = _hx_atomic_add(&mThreadJobId, 1);
+         if (allocId>=mLocalAllocs.size())
+            break;
+
+         MarkLocalAlloc(mLocalAllocs[allocId], &inCtx);
+      }
+
+      inCtx.releaseJobs();
+   }
+
+
 
    #ifdef HXCPP_VISIT_ALLOCS
    void VisitBlockAsync(hx::VisitContext *inCtx)
@@ -4982,6 +5119,12 @@ public:
 
             else if (sgThreadPoolJob==tpjAsyncZero)
                ZeroAsync();
+
+            else if (sgThreadPoolJob==tpjClearRowMarks)
+               ClearRowMarksAsync();
+
+            else if (sgThreadPoolJob==tpjStackScan)
+               StackScanAsync(context);
 
             finishThreadJob(inId);
          }
@@ -5154,7 +5297,9 @@ public:
          #endif
          gBlockStack = 0;
 
-         ClearRowMarks();
+         // Parallel over the worker pool: a single-threaded pass over every
+         // block cost 0.3-0.6ms of every begin/major pause.
+         StartThreadJobs(tpjClearRowMarks, mAllBlocks.size(), true);
       }
       else
       {
@@ -5274,6 +5419,11 @@ public:
 
       hx::RunFinalizers();
       double tM4 = __hxcpp_time_stamp();
+      {
+         int orphaned = hx::sGlobalChunks.pendingJobs();
+         if (orphaned)
+            GCPerfLog("GC-ORPHAN markall: %d mark chunks left undrained!", orphaned);
+      }
       GCPerfLog("markall roots=%.3f locals=%.3f parallel=%.3f weakfin=%.3f stacks=%d",
          (tM1-tM0)*1000, (tM2-tM1)*1000, (tM3-tM2)*1000, (tM4-tM3)*1000,
          (int)mLocalAllocs.size());
@@ -5327,18 +5477,45 @@ public:
       {
          if (inMajor)
          {
-            // Close the cycle first so the shared mark state and the free
-            // lists are consistent before the full mark runs.  Aborting
-            // mid-cycle leaves the shared MarkContext half-used, which was
-            // crashing when the application requests Gc.run(true) often.
-            for(int i=0;i<200 && sgIncrementalActive;i++)
+            // Close the cycle COMPLETELY - drain the mark and run the row
+            // sweep to the end inside the finish pause (FinishIncremental
+            // with inDrainSweep) - so the full collect below starts from a
+            // quiescent heap.  The old abort path left stale remembered
+            // chunks and half-swept state behind; combined with a sweep
+            // running between the close and this collect it produced
+            // dangling references (the clearMajor crash).
+            GCPerfLog("collect-major-close-cycle major=%d compact=%d", (int)inMajor, (int)inForceCompact);
+            // Close the cycle without aborting it: run ONE finish pause,
+            // then help the lazy sweep along (the same locked SweepOneBlock
+            // the allocation path uses) until the cycle has fully ended.
+            // A mid-cycle abort would leave the remembered chunks and mark
+            // chunks behind; draining them at the top of this STW section
+            // makes that survivable, but a clean close keeps the heap
+            // quiescent for the full collect below.
+            int spins = 0;
+            while (sgIncrementalActive)
             {
-               if (BackgroundMarkFinished())
+               if (SweepActive())
+               {
+                  // Help the lazy sweep (same locked call the allocation
+                  // path makes).  A false return means the cursor is at the
+                  // end - finalize the cycle now.
+                  if (!SweepOneBlock())
+                     FinishIncrementalSweepList();
+               }
+               else if (BackgroundMarkFinished() && !hx::gPauseForCollect)
                   FinishIncremental();
+               else if (hx::gPauseForCollect)
+                  hx::PauseForCollect();
+               if (++spins > 4000000)
+                  break;
                std::this_thread::yield();
             }
             if (sgIncrementalActive)
+            {
+               GCPerfLog("collect-major-abort-cycle major=%d compact=%d", (int)inMajor, (int)inForceCompact);
                AbortIncremental();
+            }
          }
          else
          {
@@ -5448,15 +5625,51 @@ public:
       __hxt_gc_start();
       #endif
 
-      size_t freeFraggedRows = 0; 
+      size_t freeFraggedRows = 0;
       if (inFreeIsFragged)
       {
          for(int i=mNextFreeBlockOfSize[0]; i<mFreeBlocks.size(); i++)
             freeFraggedRows += mFreeBlocks[i]->GetFreeRows();
       }
 
+      // Flush remembered-referrer chunks left behind by an aborted incremental
+      // cycle into the mark list NOW, while the world is stopped and nothing
+      // referenced inside has been freed.  The full mark below consumes them
+      // like any other work.  Leaving them on the contexts was a use-after-free:
+      // a thread stop / GC-free-zone entry pushed the stale chunk into the
+      // global list, the objects inside died in this collect's sweep, and the
+      // next mark dereferenced the freed memory (crash via clearMajor).
+      #if defined(HXCPP_GC_GENERATIONAL) || defined(HXCPP_GC_INCREMENTAL)
+      {
+         for(int i=0;i<mLocalAllocs.size();i++)
+         {
+            hx::StackContext *ctx = (hx::StackContext *)mLocalAllocs[i];
+            if (ctx->mOldReferrers)
+            {
+               if (ctx->mOldReferrers->count)
+                  hx::sGlobalChunks.addLocked(ctx->mOldReferrers);
+               else
+                  hx::sGlobalChunks.free(ctx->mOldReferrers);
+               ctx->mOldReferrers = 0;
+            }
+         }
+         for(int i=0;i<LOCAL_POOL_SIZE;i++)
+         {
+            hx::StackContext *ctx = (hx::StackContext *)mLocalPool[i];
+            if (ctx && ctx->mOldReferrers)
+            {
+               if (ctx->mOldReferrers->count)
+                  hx::sGlobalChunks.addLocked(ctx->mOldReferrers);
+               else
+                  hx::sGlobalChunks.free(ctx->mOldReferrers);
+               ctx->mOldReferrers = 0;
+            }
+         }
+      }
+      #endif
+
       // Now all threads have mTopOfStack & mBottomOfStack set.
-      bool generational = false; 
+      bool generational = false;
 
       #ifdef HXCPP_GC_GENERATIONAL
       bool compactSurviors = false;
@@ -6087,6 +6300,27 @@ public:
    // Off-main-thread marking for the incremental cycle.  A marked object can
    // be a huge array, so a per-frame time budget cannot bound a step; a worker
    // thread has no such constraint and the frame time stays untouched.
+   //
+   // MMTk runs its Concurrent bucket on every GC worker; the single dedicated
+   // thread here left three of the four pool threads idle during a cycle and
+   // cycles lost the race against mutator allocation on 3GB scenes.  With
+   // HX_MULTI_THREAD_MARKING the STW pool is reused instead: StartThreadJobs
+   // with inWait=false hands tpjMark to all MAX_GC_THREADS workers and returns
+   // immediately, and completion is just "sRunningThreads == 0".
+   #ifdef HX_MULTI_THREAD_MARKING
+   void StartBackgroundMark()
+   {
+      StartThreadJobs(tpjMark, MAX_GC_THREADS, false);
+   }
+
+   bool BackgroundMarkFinished()
+   {
+      {
+         std::lock_guard<std::mutex> l(sThreadPoolLock);
+         return sRunningThreads == 0;
+      }
+   }
+   #else
    void StartBackgroundMark()
    {
       if (!sgIncrThread)
@@ -6107,7 +6341,9 @@ public:
       std::lock_guard<std::mutex> l(sgIncrThreadLock);
       return sgIncrThreadDone && !sgIncrThreadBusy;
    }
+   #endif
 
+   #ifndef HX_MULTI_THREAD_MARKING
    void DrainMarkStackInBackground()
    {
       mMarker.init();
@@ -6118,6 +6354,7 @@ public:
          done = mMarker.processMarkStackBudget(budget);
       }
    }
+   #endif
 
 
    bool BeginIncremental()
@@ -6178,7 +6415,9 @@ public:
       hx::gMarkIDWithContainer = (hx::gByteMarkID << 24) | IMMIX_ALLOC_IS_CONTAINER;
       hx::gRememberedByteMarkID = hx::gByteMarkID | HX_GC_REMEMBERED;
       gBlockStack = 0;
-      ClearRowMarks();
+      // Parallel over the worker pool (pool is idle here: StopThreadJobs ran
+      // above) - the single-threaded pass cost 0.3-0.6ms of every begin pause.
+      StartThreadJobs(tpjClearRowMarks, mAllBlocks.size(), true);
 
       mMarker.init();
       mMarker.isGenerational = false;
@@ -6217,6 +6456,13 @@ public:
       hx::gIncrementalMarking = true;
       sgIsCollecting = false;
 
+      // The roots marked above sit in mMarker's local chunk; publish it so the
+      // background workers can drain everything, then hand tpjMark to the
+      // pool.  Threads wake with the world still paused and are already
+      // draining when the mutators resume.
+      mMarker.releaseJobs();
+      StartBackgroundMark();
+
       hx::gPauseForCollect = 0x00000000;
       #ifndef HXCPP_SINGLE_THREADED_APP
       for(int i=0;i<mLocalAllocs.size();i++)
@@ -6234,10 +6480,9 @@ public:
       sStwPauseSeconds = __hxcpp_time_stamp() - tBegin;
       sCycleCount++;
       #ifdef HXCPP_DEBUG
-      GCPerfLog("begin %.3fms used=%d wm=%d blocks=%d", (__hxcpp_time_stamp()-tBegin)*1000,
-         (int)MemUsage(), (int)sWorkingMemorySize, (int)mAllBlocks.size());
+      GCPerfLog("begin %.3fms used=%d wm=%d blocks=%d threads=%d", (__hxcpp_time_stamp()-tBegin)*1000,
+         (int)MemUsage(), (int)sWorkingMemorySize, (int)mAllBlocks.size(), (int)MAX_GC_THREADS);
       #endif
-      StartBackgroundMark();
       return true;
    }
 
@@ -6344,6 +6589,10 @@ public:
       GCTrace("finish-roots");
       double tRoots = __hxcpp_time_stamp();
       PhaseMax(sGcPhases.finishDrain, tRoots - tPaused);
+      // NOTE: the stack scan stays on the main thread.  A parallel version
+      // (tpjStackScan) measured 10-78ms here at real frame rates vs 0.5-0.9ms
+      // sequential - the conservative scan of garbage-dense mutator stacks
+      // does not parallelize well (cache/lock effects), so it was reverted.
       MarkIncrementalRoots(true);
       double tRootsDone = __hxcpp_time_stamp();
       PhaseMax(sGcPhases.finishRoots, tRootsDone - tRoots);
@@ -6355,6 +6604,11 @@ public:
       mMarker.processMarkStack();
       #endif
       GCTrace("finish-marked");
+      {
+         int orphaned = hx::sGlobalChunks.pendingJobs();
+         if (orphaned)
+            GCPerfLog("GC-ORPHAN finish-mark: %d mark chunks left undrained!", orphaned);
+      }
       tMarked = __hxcpp_time_stamp();
       PhaseMax(sGcPhases.finishMark, tMarked - tRootsDone);
 
@@ -6488,12 +6742,24 @@ public:
       if (!sgIncrementalActive)
          return;
 
+      // With pool marking, StopThreadJobs both waits for the workers to drain
+      // (sgThreadPoolAbort makes them exit early) and resets the pool state
+      // (sAllThreads/job/sLazyThreads).  The dedicated-thread fallback keeps
+      // the old cv handshake.
+      #ifdef HX_MULTI_THREAD_MARKING
+      StopThreadJobs(true);
+      #else
       {
          std::lock_guard<std::mutex> l(sgIncrThreadLock);
          sgIncrThreadRequest = false;
       }
       while (!BackgroundMarkFinished())
          std::this_thread::yield();
+      {
+         std::lock_guard<std::mutex> l(sgIncrThreadLock);
+         sgIncrThreadDone = false;
+      }
+      #endif
 
       sgIncrementalActive = 0;
       hx::gIncrementalMarking = false;
@@ -6501,10 +6767,6 @@ public:
       sgIsCollecting = false;
       sIncrStepTotal = 0;
       sIncrStepFrames = 0;
-      {
-         std::lock_guard<std::mutex> l(sgIncrThreadLock);
-         sgIncrThreadDone = false;
-      }
    }
 
 
@@ -6619,6 +6881,11 @@ public:
       // list: pushing thousands of entries here cost ~0.4ms of the finish
       // pause for nothing.  mAllBlocks only ever grows, and newly added
       // blocks are empty, so reclaiming them is cheap and safe.
+      {
+         int orphaned = hx::sGlobalChunks.pendingJobs();
+         if (orphaned)
+            GCPerfLog("GC-ORPHAN sweep-start: %d mark chunks never drained!", orphaned);
+      }
       for(int i=0;i<mAllBlocks.size();i++)
       {
          // Every allocator was just reset, so no block is really owned now.
@@ -8560,6 +8827,9 @@ unsigned int __hxcpp_obj_hash(Dynamic inObj)
 void DummyFunction(void *inPtr) { }
 
 
+#ifndef HX_MULTI_THREAD_MARKING
+// Dedicated incremental-marking worker for builds without the marking thread
+// pool; pool builds hand tpjMark to StartThreadJobs instead.
 static void IncrMarkThreadProc()
 {
    while(true)
@@ -8584,6 +8854,7 @@ static void IncrMarkThreadProc()
       sgIncrThreadCv.notify_all();
    }
 }
+#endif
 
 
 // --- Frame-driven collection scheduling ------------------------------------
@@ -8633,8 +8904,19 @@ bool __hxcpp_gc_frame_tick(int inBudgetMicros, bool inAllowFull, double inFrameM
    {
       if (sGlobalAlloc->SweepActive())
       {
-         // Rows are reclaimed lazily on the allocation path; the main thread
-         // only finalises the bookkeeping once every block was swept.
+         // Drive the lazy sweep from the frame tick with a small budget.
+         // The allocation path only advances the sweep on free-list misses,
+         // so a healthy free list leaves the sweep crawling for a whole
+         // scene: sgIncrementalActive stays set, the pacer is blocked, and
+         // every frag-finish re-runs the finish (the full-fps crash).
+         double sweepDeadline = __hxcpp_time_stamp() + (budget > 0 ? budget : 200) * 1.0e-6;
+         while (sGlobalAlloc->SweepActive())
+         {
+            if (!sGlobalAlloc->SweepOneBlock())
+               break;
+            if (__hxcpp_time_stamp() >= sweepDeadline)
+               break;
+         }
          if (sGlobalAlloc->SweepDone())
             sGlobalAlloc->FinishIncrementalSweepList();
          return true;
