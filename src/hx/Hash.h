@@ -340,10 +340,20 @@ struct Hash : public HashBase< typename ELEMENT::Key >
 
    ELEMENT **bucket;
 
+   // Rehash-in-progress flag.  A marker walking the buckets while the
+   // mutator is mid-rebucket/compact can hit an element in neither chain
+   // (the unlink/relink pair is not atomic) and miss it, after which the
+   // sweep frees live data (the Hash::find SEGV under concurrent mutators).
+   // The re-link loop holds no safepoints and completes in microseconds, so
+   // a concurrent marker simply spins until it is done; the STW pause can
+   // only park this thread outside the region, where the table is whole.
+   volatile int rehashing;
+
 
    Hash() : HashBase<Key>( StoreOf<Value>::store )
    {
       bucket = 0;
+      rehashing = 0;
       if (ELEMENT::WeakKeys && Element::ManageKeys)
          RegisterWeakHash(this);
    }
@@ -378,6 +388,8 @@ struct Hash : public HashBase< typename ELEMENT::Key >
    {
       if (!Element::WeakKeys || !Element::ManageKeys)
          return false;
+
+      while (rehashing) { }
 
       bool marked = false;
       for(int b=0;b<bucketCount;b++)
@@ -423,6 +435,11 @@ struct Hash : public HashBase< typename ELEMENT::Key >
 #endif
       mask = inNewCount-1;
       //printf("expand %d -> %d\n",bucketCount, inNewCount);
+      // The realloc allocates (a safepoint!), so it runs BEFORE the rehashing
+      // flag goes up: a thread must never park inside the re-link loop, or a
+      // marker walking the buckets would see the half-rehashed chains, miss
+      // an element that is in neither chain, and the sweep would free live
+      // data (the Hash::find SEGV under concurrent mutators).
       bucket = (Element **)InternalRealloc(bucketCount*sizeof(ELEMENT *), bucket,inNewCount*sizeof(ELEMENT *));
       HX_OBJ_WB_GET(this, bucket);
       //for(int b=bucketCount;b<inNewCount;b++)
@@ -433,6 +450,11 @@ struct Hash : public HashBase< typename ELEMENT::Key >
 #endif
 
 
+      // The re-link loop has no safepoints: a concurrent marker spinning on
+      // the flag below is guaranteed the loop completes and the chains are
+      // whole again, and the STW pause can only park this thread outside the
+      // region, where the table is consistent.
+      rehashing = 1;
       for(int b=0;b<bucketCount;b++)
       {
          Element **head = &bucket[b];
@@ -452,6 +474,7 @@ struct Hash : public HashBase< typename ELEMENT::Key >
       }
 
       bucketCount = inNewCount;
+      rehashing = 0;
    }
 
    void reserve(int inSize)
@@ -468,6 +491,11 @@ struct Hash : public HashBase< typename ELEMENT::Key >
       int newSize = bucketCount>>1;
       // printf("compact -> %d\n", newSize);
       mask = newSize-1;
+      // Same concurrent-marker protection as rebucket: the splice
+      // transiently orphans the appended chain, and the loop must not be
+      // interruptible by a safepoint.  The realloc (which allocates) stays
+      // outside the flag.
+      rehashing = 1;
       for(int b=newSize; b<bucketCount; b++)
       {
          Element *head = bucket[b];
@@ -488,6 +516,7 @@ struct Hash : public HashBase< typename ELEMENT::Key >
          }
       }
       bucketCount = newSize;
+      rehashing = 0;
       bucket = (Element **)InternalRealloc(origSize*sizeof(ELEMENT *),bucket, sizeof(ELEMENT *)*bucketCount );
       HX_OBJ_WB_GET(this, bucket);
    }
@@ -639,15 +668,25 @@ struct Hash : public HashBase< typename ELEMENT::Key >
       el = allocElement();
       el->setKey(inKey,hash);
       CopyValue(el->value,inValue);
+      // The two linking stores are not atomic together: an element between
+      // them is in neither chain, and a concurrent marker walking the
+      // buckets would miss it (the sweep would then free it while the hash
+      // still references it - the Hash::find SEGV).  Hold the rehashing
+      // flag across the stores; a concurrent marker spins for two
+      // instructions.  The flag also gates the re-scan itself: it happens
+      // below, after the flag clears, so it always sees the linked element.
+      rehashing = 1;
       el->next = bucket[hash&mask];
       bucket[hash&mask] = el;
+      rehashing = 0;
 
       #if defined(HXCPP_GC_GENERATIONAL) || defined(HXCPP_GC_INCREMENTAL)
       unsigned char &mark =  ((unsigned char *)(this))[ HX_ENDIAN_MARK_ID_BYTE];
       #ifdef HXCPP_GC_INCREMENTAL
       // Incremental marking: any insertion can create a black->white edge
       // (a fresh String key, or an old key that has not been marked yet).
-      // Record the hash unconditionally; the finishing pass rescans its fields.
+      // Record the hash; the worker that picks the chunk up re-scans it
+      // promptly.
       if (::hx::gIncrementalMarking && mark == hx::gByteMarkID)
       {
          mark|=HX_GC_REMEMBERED;
@@ -846,6 +885,12 @@ struct Hash : public HashBase< typename ELEMENT::Key >
 
    void __Mark(hx::MarkContext *__inCtx) HXCPP_OVERRIDE
    {
+      // A concurrent marker must not walk a half-rehashed table - the
+      // re-link loop has no safepoints and finishes in microseconds, so
+      // spin it out.  The STW pause can only park the rehashing thread
+      // outside the region, so this also holds during the finish.
+      while (rehashing) { }
+
       HX_MARK_ARRAY(bucket);
 
       HashMarker marker(__inCtx);

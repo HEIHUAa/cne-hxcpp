@@ -174,6 +174,15 @@ static void GCPerfLog(const char *inFormat, ...)
    fclose(f);
 }
 
+// Bisection switches for the concurrent-mutator crash hunt: setting the env
+// var to 1 disables one subsystem at a time so the crashing run can be
+// narrowed down.  (HXCPP_NO_ASYNC_ZERO / HXCPP_NO_SHRINK / HXCPP_NO_FRAGFINISH)
+static bool gcBisectFlag(const char *inName)
+{
+   const char *v = getenv(inName);
+   return v && v[0]=='1';
+}
+
 // A single collection can drop thousands of large objects, and free() of the
 // big blocks alone cost up to ~25ms in gc_perf.log.  Empty block groups are
 // the same story: releasing hundreds of MB through HxFreeGCBlock (VirtualFree)
@@ -4009,19 +4018,24 @@ public:
          return;
 
       size_t liveRows = LiveBytes() >> IMMIX_LINE_BITS;
-      // MMTk's ConcurrentImmix trigger: start the cycle when half of the
-      // FREE heap capacity has been consumed, so the concurrent marker
-      // always has the other half as headroom.  Tying the threshold to
-      // sWorkingMemorySize (which the target-free-space percentage inflates
-      // to live*5) started cycles far too late: the mutator ran out of
-      // usable holes and every cycle ended in a fragmentation abort.
       size_t capRows = GetWorkingMemory() >> IMMIX_LINE_BITS;
-      // 75% of the free capacity: at 1000fps the mutator burns the remaining
-      // quarter in well under a second (the marker finishes the live set in
-      // about that time), and a fragmentation miss now costs a ~2ms
-      // frag-finish instead of a full stop-the-world collect, so the extra
-      // headroom is worth more than the insurance.
-      size_t thresholdRows = liveRows + (((capRows - liveRows) * 3) >> 2);
+      // Trigger when the allocation SINCE THE LAST GC COMPLETED has consumed
+      // 75% of the free capacity that existed at that point, leaving 25% as
+      // proportional headroom for the concurrent marker.  sRowsSinceCycle is
+      // reset at cycle completion (MMTk's used_pages_after_last_gc
+      // semantics), so it counts only fresh allocation and the live set must
+      // NOT be added to the threshold - unlike the old start-reset formula,
+      // where the counter re-counted the live rows every cycle.
+      // Compared with MMTk ConcurrentImmix's total_pages >> 1, this fires a
+      // little later while the heap has room (fewer cycle pauses) and
+      // behaves proportionally when live approaches the capacity, instead of
+      // MMTk's immediate back-to-back re-triggering.  A 25% variant (fires
+      // 3x earlier) was A/B tested and was strictly worse: the per-cycle
+      // fixed costs (begin setup + root re-scan + finish) do not shrink
+      // with headroom, so tripling their frequency tripled the outliers,
+      // including a 28.5ms finish drain when a burst collided with a cycle
+      // closing during a marker budget slice.
+      size_t thresholdRows = ((capRows - liveRows) * 3) >> 2;
       size_t minRows = (size_t)(8<<20) >> IMMIX_LINE_BITS;
       if (thresholdRows < minRows)
          thresholdRows = minRows;
@@ -4119,7 +4133,7 @@ public:
                result = GetNextFree(inRequiredBytes);
          }
 
-         if (!result && sgIncrementalActive)
+         if (!result && sgIncrementalActive && !gcBisectFlag("HXCPP_NO_FRAGFINISH"))
          {
             // Fragmented: every block has a hole smaller than the request, so
             // no amount of growing helps.  If the concurrent mark is already
@@ -4610,9 +4624,16 @@ public:
    {
       for(int i=0;i<gAllocGroups.size();i++)
          gAllocGroups[i].isEmpty = true;
+      // Owned blocks hold live mutator data even when their row counters are
+      // stale (the sweep skips owned blocks without updating mUsedRows), so
+      // their groups must never be marked empty - releasing such a group
+      // frees live data (the Hash::query crash).
       for(int i=0;i<mAllBlocks.size();i++)
-         if (!mAllBlocks[i]->isEmpty())
-            gAllocGroups[mAllBlocks[i]->mGroupId].isEmpty = false;
+      {
+         BlockDataInfo *info = mAllBlocks[i];
+         if (!info->isEmpty() || info->mOwned)
+            gAllocGroups[info->mGroupId].isEmpty = false;
+      }
 
       size_t released = 0;
       for(int i=0;i<gAllocGroups.size() && released<releaseSize;i++)
@@ -4632,6 +4653,44 @@ public:
 
       if (!released)
          return 0;
+
+
+      // The compaction pass below deletes the BlockDataInfo of every
+      // released group (destroy() is "delete this").  createFreeList pushes
+      // fully-empty blocks into mFreeBlocks and backgroundProcessFreeList
+      // copies that list into mZeroList, so without filtering, both hold
+      // dangling pointers and the next GetNextFree dereferences freed
+      // metadata (upstream releaseEmptyGroups has the same hole - it just
+      // never fires with upstream heap sizes).  Filter the free list FIRST,
+      // while every info is still alive, and rebuild the per-size-class
+      // index array exactly like createFreeList does.  The relative order of
+      // surviving entries is still the sorted one, so the removal preserves
+      // SmallestFreeFirst.
+      int fWrite = 0;
+      for(int i=0;i<mFreeBlocks.size();i++)
+      {
+         BlockDataInfo *info = mFreeBlocks[i];
+         if (gAllocGroups[info->mGroupId].alloc)
+            mFreeBlocks[fWrite++] = info;
+      }
+      mFreeBlocks.setSize(fWrite);
+      for(int i=0;i<BLOCK_OFSIZE_COUNT;i++)
+         mNextFreeBlockOfSize[i] = fWrite;
+      for(int i=fWrite-1;i>=0;i--)
+      {
+         int slot = mFreeBlocks[i]->mMaxHoleSize >> IMMIX_LINE_BITS;
+         if (slot>=BLOCK_OFSIZE_COUNT)
+            slot = BLOCK_OFSIZE_COUNT-1;
+         mNextFreeBlockOfSize[slot] = i;
+      }
+      for(int i=BLOCK_OFSIZE_COUNT-2;i>=0;i--)
+         if (mNextFreeBlockOfSize[i]>mNextFreeBlockOfSize[i+1])
+            mNextFreeBlockOfSize[i] = mNextFreeBlockOfSize[i+1];
+      // The zero list holds copies of the old free list; async zero jobs are
+      // stopped during this pause.  Clear both sides of the handshake - the
+      // next backgroundProcessFreeList rebuilds it from the filtered list.
+      mZeroList.clear();
+      mZeroListQueue = 0;
 
       int write = 0;
       for(int i=0;i<mAllBlocks.size();i++)
@@ -4656,7 +4715,10 @@ public:
       int groups=0;
       for(int i=0; i<mAllBlocks.size(); i++ )
       {
-         if (!mAllBlocks[i]->isEmpty())
+         // Owned blocks hold live mutator data even when the row counters
+         // are stale - never mark their group empty (same hole as
+         // ShrinkBlocks, same defensive guard).
+         if (!mAllBlocks[i]->isEmpty() || mAllBlocks[i]->mOwned)
              gAllocGroups[mAllBlocks[i]->mGroupId].isEmpty=false;
       }
 
@@ -4691,6 +4753,34 @@ public:
 
             releaseSize -= groupBytes;
          }
+      }
+
+      // The erase loop below deletes the BlockDataInfo of released groups;
+      // filter the free list first (see ShrinkBlocks - same dangling
+      // pointer, upstream hole).
+      {
+         int fWrite = 0;
+         for(int i=0;i<mFreeBlocks.size();i++)
+         {
+            BlockDataInfo *info = mFreeBlocks[i];
+            if (gAllocGroups[info->mGroupId].alloc)
+               mFreeBlocks[fWrite++] = info;
+         }
+         mFreeBlocks.setSize(fWrite);
+         for(int i=0;i<BLOCK_OFSIZE_COUNT;i++)
+            mNextFreeBlockOfSize[i] = fWrite;
+         for(int i=fWrite-1;i>=0;i--)
+         {
+            int slot = mFreeBlocks[i]->mMaxHoleSize >> IMMIX_LINE_BITS;
+            if (slot>=BLOCK_OFSIZE_COUNT)
+               slot = BLOCK_OFSIZE_COUNT-1;
+            mNextFreeBlockOfSize[slot] = i;
+         }
+         for(int i=BLOCK_OFSIZE_COUNT-2;i>=0;i--)
+            if (mNextFreeBlockOfSize[i]>mNextFreeBlockOfSize[i+1])
+               mNextFreeBlockOfSize[i] = mNextFreeBlockOfSize[i+1];
+         mZeroList.clear();
+         mZeroListQueue = 0;
       }
 
       // Release blocks
@@ -6024,7 +6114,7 @@ public:
       // pointer.
       {
          size_t currentCap = GetWorkingMemory();
-         if (currentCap > sWorkingMemorySize + (64<<20))
+         if (currentCap > sWorkingMemorySize + (64<<20) && !gcBisectFlag("HXCPP_NO_SHRINK"))
          {
             for(int i=0;i<mLocalAllocs.size();i++)
                ClearPooledAlloc(mLocalAllocs[i]);
@@ -6767,6 +6857,11 @@ public:
       sgIsCollecting = false;
       sIncrStepTotal = 0;
       sIncrStepFrames = 0;
+      // MMTk counts pages allocated since the last GC COMPLETED, so the
+      // next trigger measures allocation from here, not from the cycle
+      // start.  (sRowsSinceCycle is also reset in BeginIncremental for the
+      // pacing logs; this completion reset is what the trigger compares.)
+      sRowsSinceCycle = 0;
    }
 
 
@@ -7037,6 +7132,7 @@ public:
       // because the free rows are still being rebuilt.
       hx::gIncrementalMarking = false;
       sgIncrementalActive = 0;
+      sRowsSinceCycle = 0;
       sUsageAtLastCollect = MemUsage();
       sGcLastCollectFrame = sGcFrameCount;
       sGcLastTickUsage = MemUsage();
@@ -7144,6 +7240,14 @@ public:
    void backgroundProcessFreeList(bool inJit)
    {
       mZeroListQueue = 0;
+      // Bisection: skip the async zeroing entirely - claimers then zero their
+      // blocks inline (ZEROED_NOT path), removing the zero-vs-claim race
+      // from the equation.
+      if (gcBisectFlag("HXCPP_NO_ASYNC_ZERO"))
+      {
+         mZeroList.clear();
+         return;
+      }
       #ifdef HX_GC_ZERO_EARLY
       mZeroList.setSize(mFreeBlocks.size());
       memcpy( &mZeroList[0], &mFreeBlocks[0], mFreeBlocks.size()*sizeof(void *));
@@ -7288,7 +7392,14 @@ namespace hx
 
 MarkChunk *MarkChunk::swapForNew()
 {
-   return sGlobalChunks.pushJobNoWake(this);
+   // MMTk's ObjectBarrier enqueues the modified object where the workers can
+   // pick it up immediately; pushJobNoWake left full referrer chunks sitting
+   // on the global list while the workers slept, so every chunk pushed after
+   // the initial drain accumulated until the finish pause drained the whole
+   // backlog in one stop-the-world step (finish mark grew with the frame
+   // rate: 24-28ms at ~800fps).  pushJob wakes a parked worker and still
+   // returns a fresh chunk for the next barrier buffer.
+   return sGlobalChunks.pushJob(this,true);
 }
 
 
