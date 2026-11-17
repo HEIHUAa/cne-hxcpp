@@ -34,7 +34,12 @@ size_t sgMinimumWorkingMemory       = 8*1024*1024;
 size_t sgMinimumFreeSpace           = 4*1024*1024;
 #endif
 // Once you use more than the minimum, this kicks in...
-int sgTargetFreeSpacePercentage  = 100;
+// Headroom above the live set: target = live * (1 + pct/100).  300% keeps the
+// block heap at 4x live, which halves the collect frequency compared to the
+// old 100% (target 2x live) - fewer stop-the-world pauses at the cost of a
+// larger heap, per the owner's memory-for-smoothness preference.  Mark cost
+// scales with the live set, so the pauses grow only mildly.
+int sgTargetFreeSpacePercentage  = 300;
 
 
 

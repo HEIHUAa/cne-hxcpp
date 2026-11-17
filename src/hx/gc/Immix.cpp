@@ -8,6 +8,8 @@
 #include <hx/Unordered.h>
 #include <mutex>
 #include <condition_variable>
+#include <thread>
+#include <stdarg.h>
 
 #ifdef __EMSCRIPTEN__
    #include <emscripten/stack.h>
@@ -22,6 +24,139 @@
 
 
 static bool sgIsCollecting = false;
+
+// --- Crash dump on fatal SEH (GC diagnostics) -------------------------------
+// A native crash dies with no dump: WER LocalDumps is not honored here and
+// the game's handler only sees Haxe-level errors.  Install a last-chance SEH
+// filter that writes a full-memory dump when the environment variable
+// GC_CRASH_DUMP_DIR points at a directory.  Nothing changes when the variable
+// is unset, and the filter returns CONTINUE_SEARCH so the original crash
+// behavior (exit code, WER) is preserved.
+#ifdef HX_WINDOWS
+#include <windows.h>
+#include <dbghelp.h>
+#pragma comment(lib, "dbghelp.lib")
+
+static LONG WINAPI GcCrashDumpFilter(EXCEPTION_POINTERS *inInfo)
+{
+   static bool sDumped = false;
+   if (!sDumped)
+   {
+      sDumped = true;
+      const char *dir = getenv("GC_CRASH_DUMP_DIR");
+      if (dir && *dir)
+      {
+         char path[MAX_PATH];
+         snprintf(path, sizeof(path), "%s\\gc-crash-%u.dmp", dir, (unsigned)GetCurrentProcessId());
+         HANDLE file = CreateFileA(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+         if (file != INVALID_HANDLE_VALUE)
+         {
+            MINIDUMP_EXCEPTION_INFORMATION mei;
+            mei.ThreadId = GetCurrentThreadId();
+            mei.ExceptionPointers = inInfo;
+            mei.ClientPointers = FALSE;
+            MiniDumpWriteDump(GetCurrentProcess(), GetCurrentProcessId(), file,
+               MiniDumpWithFullMemory, &mei, NULL, NULL);
+            CloseHandle(file);
+         }
+      }
+   }
+   return EXCEPTION_CONTINUE_SEARCH;
+}
+
+static void GcRegisterCrashDumpFilter()
+{
+   SetUnhandledExceptionFilter(GcCrashDumpFilter);
+}
+static bool sGcCrashDumpRegistered = (GcRegisterCrashDumpFilter(), true);
+#endif
+
+// Timing for the collections.  GUI builds have no console, so the numbers go
+// to a file next to the executable.
+static void GCPerfLog(const char *inFormat, ...)
+{
+   FILE *f = fopen("gc_perf.log","a");
+   if (!f)
+      return;
+   va_list args;
+   va_start(args, inFormat);
+   vfprintf(f, inFormat, args);
+   va_end(args);
+   fputc('\n', f);
+   fclose(f);
+}
+
+// Bisection switches: setting the env var to 1 disables one subsystem at a
+// time so a crashing run can be narrowed down.
+static bool gcBisectFlag(const char *inName)
+{
+   const char *v = getenv(inName);
+   return v && v[0]=='1';
+}
+
+// A single collection can drop thousands of large objects, and free() of the
+// big blocks alone costs milliseconds inside the pause.  Empty block groups
+// are the same story: releasing hundreds of MB through HxFreeGCBlock
+// (VirtualFree) took tens of ms inside the pause.  Hand both to a worker so
+// the collection itself only pays the queue push.
+struct GCDeferredFree { void *ptr; bool isBlock; };
+static std::mutex                  sgFreeLock;
+static std::condition_variable     sgFreeCv;
+static std::vector<GCDeferredFree> sgFreeQueue;
+static std::thread                *sgFreeThread = 0;
+static bool                        sgFreeQuit = false;
+
+static void GCDeferredFreeThreadProc()
+{
+   while(true)
+   {
+      std::vector<GCDeferredFree> batch;
+      {
+         std::unique_lock<std::mutex> l(sgFreeLock);
+         sgFreeCv.wait(l, [](){ return !sgFreeQueue.empty() || sgFreeQuit; });
+         if (sgFreeQueue.empty() && sgFreeQuit)
+            return;
+         batch.swap(sgFreeQueue);
+      }
+      for(size_t i=0;i<batch.size();i++)
+      {
+         if (batch[i].isBlock)
+            HxFreeGCBlock(batch[i].ptr);
+         else
+            HxFree(batch[i].ptr);
+      }
+   }
+}
+
+static void QueueGCFree(void *inPtr, bool inIsBlock)
+{
+   {
+      std::lock_guard<std::mutex> l(sgFreeLock);
+      GCDeferredFree item;
+      item.ptr = inPtr;
+      item.isBlock = inIsBlock;
+      sgFreeQueue.push_back(item);
+   }
+   if (!sgFreeThread)
+   {
+      sgFreeThread = new std::thread(GCDeferredFreeThreadProc);
+      sgFreeThread->detach();
+   }
+   sgFreeCv.notify_one();
+}
+
+static void QueueLargeFree(unsigned int *inBlob)
+{
+   QueueGCFree(inBlob, false);
+}
+
+// Block groups are not touched by anything once their GroupInfo.alloc is
+// cleared and the block list is rebuilt, so the OS release can happen
+// whenever the worker gets to it.
+static void QueueBlockGroupFree(void *inGroup)
+{
+   QueueGCFree(inGroup, true);
+}
 
 namespace hx
 {
@@ -4089,7 +4224,11 @@ public:
       int groups=0;
       for(int i=0; i<mAllBlocks.size(); i++ )
       {
-         if (!mAllBlocks[i]->isEmpty())
+         // Owned blocks hold live mutator data even when their row counters
+         // are stale (the sweep skips owned blocks without updating
+         // mUsedRows), so their groups must never be marked empty -
+         // releasing such a group frees live data (the Hash::query crash).
+         if (!mAllBlocks[i]->isEmpty() || mAllBlocks[i]->mOwned)
              gAllocGroups[mAllBlocks[i]->mGroupId].isEmpty=false;
       }
 
@@ -4114,7 +4253,10 @@ public:
             releasedGids.push_back(i);
             #endif
 
-            HxFreeGCBlock(g.alloc);
+            // Async OS release: VirtualFree of hundreds of MB measured tens
+            // of ms inside this pause.  Nothing references the group memory
+            // any more once the lists below are rebuilt.
+            QueueBlockGroupFree(g.alloc);
             g.alloc = 0;
 
             groups++;
@@ -4126,29 +4268,61 @@ public:
          }
       }
 
-      // Release blocks
-      for(int i=0; i<mAllBlocks.size();  )
+      // Release blocks.  The compaction pass deletes the BlockDataInfo of
+      // every released group (destroy() is "delete this").  createFreeList
+      // pushes fully-empty blocks into mFreeBlocks, so without filtering,
+      // mFreeBlocks holds dangling pointers and the next GetNextFree
+      // dereferences freed metadata.  Filter the free list FIRST, while
+      // every info is still alive, and rebuild the per-size-class index
+      // array exactly like createFreeList does.  The relative order of the
+      // surviving entries stays sorted, so SmallestFreeFirst is preserved.
+      int fWrite = 0;
+      for(int i=0;i<mFreeBlocks.size();i++)
       {
-         if (!gAllocGroups[mAllBlocks[i]->mGroupId].alloc)
+         BlockDataInfo *info = mFreeBlocks[i];
+         if (gAllocGroups[info->mGroupId].alloc)
+            mFreeBlocks[fWrite++] = info;
+      }
+      mFreeBlocks.setSize(fWrite);
+      for(int i=0;i<BLOCK_OFSIZE_COUNT;i++)
+         mNextFreeBlockOfSize[i] = fWrite;
+      for(int i=fWrite-1;i>=0;i--)
+      {
+         int slot = mFreeBlocks[i]->mMaxHoleSize >> IMMIX_LINE_BITS;
+         if (slot>=BLOCK_OFSIZE_COUNT)
+            slot = BLOCK_OFSIZE_COUNT-1;
+         mNextFreeBlockOfSize[slot] = i;
+      }
+      for(int i=BLOCK_OFSIZE_COUNT-2;i>=0;i--)
+         if (mNextFreeBlockOfSize[i]>mNextFreeBlockOfSize[i+1])
+            mNextFreeBlockOfSize[i] = mNextFreeBlockOfSize[i+1];
+
+      // Compact mAllBlocks in place (erase() shifted the whole tail on every
+      // removal, which made big releases O(n^2)).
+      int write = 0;
+      for(int i=0; i<mAllBlocks.size(); i++)
+      {
+         BlockDataInfo *info = mAllBlocks[i];
+         if (!gAllocGroups[info->mGroupId].alloc)
          {
             outStats.emptyBlocks--;
             released++;
-            mAllBlocks[i]->destroy();
-            mAllBlocks.erase(i);
+            info->destroy();
          }
          else
          {
             #ifdef HXCPP_GC_VERIFY
             for(int g=0;g<releasedGids.size();g++)
-               if (mAllBlocks[i]->mGroupId == releasedGids[g])
+               if (info->mGroupId == releasedGids[g])
                {
-                  printf("Group %d should be released.\n", mAllBlocks[i]->mGroupId);
+                  printf("Group %d should be released.\n", info->mGroupId);
                   DebuggerTrap();
                }
             #endif
-            i++;
+            mAllBlocks[write++] = info;
          }
       }
+      mAllBlocks.setSize(write);
 
       #ifdef HXCPP_GC_VERIFY
       for(int i=0;i<mAllBlocks.size();i++)
@@ -4872,6 +5046,7 @@ public:
       #endif
 
       STAMP(t0)
+      double tPerf0 = __hxcpp_time_stamp();
 
       // We are the collector - all must wait for us
       LocalAllocator *this_local = 0;
@@ -4973,6 +5148,7 @@ public:
       #endif
 
       STAMP(t2)
+      double tPerfMark = __hxcpp_time_stamp();
 
 
       // Sweep blocks
@@ -5090,6 +5266,7 @@ public:
       size_t bytesInUse = mRowsInUse<<IMMIX_LINE_BITS;
 
       STAMP(t3)
+      double tPerfReclaim = __hxcpp_time_stamp();
 
 
       #ifdef HXCPP_TELEMETRY
@@ -5103,7 +5280,7 @@ public:
       //  clear old frames recycle objects
       int l2 = largeObjectRecycle.size();
       for(int i=0;i<largeObjectRecycle.size();i++)
-         HxFree(largeObjectRecycle[i]);
+         QueueLargeFree(largeObjectRecycle[i]);
       largeObjectRecycle.setSize(0);
 
       size_t recycleRemaining = 0;
@@ -5112,11 +5289,14 @@ public:
          recycleRemaining = mLargeAllocForceRefresh;
       #endif
 
-      int idx = 0;
+      // Compact the live entries in place.  qerase() shifts the whole tail on
+      // every removal, which made this sweep O(n^2) with thousands of large
+      // objects - the largest single stall seen in gc_perf.log on a 3GB song.
+      int live = 0;
       int l0 = mLargeList.size();
-      while(idx<mLargeList.size())
+      for(int i=0;i<l0;i++)
       {
-         unsigned int *blob = mLargeList[idx];
+         unsigned int *blob = mLargeList[i];
          if ( (blob[1] & IMMIX_ALLOC_MARK_ID) != hx::gMarkID )
          {
             unsigned int size = *blob;
@@ -5128,19 +5308,19 @@ public:
             }
             else
             {
-               HxFree(blob);
+               QueueLargeFree(blob);
             }
-
-            mLargeList.qerase(idx);
          }
          else
-            idx++;
+            mLargeList[live++] = blob;
       }
+      mLargeList.setSize(live);
 
       int l1 = mLargeList.size();
 
 
       STAMP(t4)
+      double tPerfLarge = __hxcpp_time_stamp();
 
       bool defragged = false;
 
@@ -5221,6 +5401,10 @@ public:
                      #endif
 
                      int releasedBlocks = releaseEmptyGroups(stats, releaseSize);
+                     if (releasedBlocks)
+                        GCPerfLog("release blocks=%d (%dMB) cap=%dMB used=%dMB",
+                           releasedBlocks, (int)(releasedBlocks>>(20-IMMIX_BLOCK_BITS)),
+                           (int)(GetWorkingMemory()>>20), (int)(MemUsage()>>20));
                      #ifdef SHOW_FRAGMENTATION
                      int releasedGroups = releasedBlocks >> IMMIX_BLOCK_GROUP_BITS;
                      GCLOG(" Released %s, %d groups\n", formatBytes((size_t)releasedBlocks<<IMMIX_BLOCK_BITS).c_str(), releasedGroups );
@@ -5250,6 +5434,7 @@ public:
 
 
       STAMP(t5)
+      double tPerfStats = __hxcpp_time_stamp();
 
       size_t mem = mRowsInUse<<IMMIX_LINE_BITS;
       size_t baseMem = full ? bytesInUse : mem;
@@ -5319,6 +5504,14 @@ public:
       // This saves some running/stall time, but increases the total CPU usage
       // Delaying it until just before the block is used to improve the cache locality
       backgroundProcessFreeList(true);
+
+      {
+         double tPerfEnd = __hxcpp_time_stamp();
+         GCPerfLog("collect total=%.3f mark=%.3f reclaim=%.3f large=%.3f stats=%.3f freelist=%.3f used=%d blocks=%d",
+            (tPerfEnd-tPerf0)*1000, (tPerfMark-tPerf0)*1000, (tPerfReclaim-tPerfMark)*1000,
+            (tPerfLarge-tPerfReclaim)*1000, (tPerfStats-tPerfLarge)*1000, (tPerfEnd-tPerfStats)*1000,
+            (int)MemUsage(), (int)mAllBlocks.size());
+      }
 
       mAllBlocksCount   = mAllBlocks.size();
       mCurrentRowsInUse = mRowsInUse;
