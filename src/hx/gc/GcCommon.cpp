@@ -34,10 +34,13 @@ size_t sgMinimumWorkingMemory       = 8*1024*1024;
 size_t sgMinimumFreeSpace           = 4*1024*1024;
 #endif
 // Once you use more than the minimum, this kicks in...
-// Higher = fewer stop-the-world collections at the cost of a larger heap.
-// The absolute cap is enforced by the collector, which returns empty block
-// groups to the OS after a collection (MMTk's shrink), so a high percentage
-// no longer pins a temporary peak forever.
+// Headroom above the live set: target = live * (1 + pct/100).  The owner's
+// stated policy is to trade memory for smoothness, and the trigger now uses
+// the stable target (not the ratcheting physical heap), so a high percentage
+// no longer inflates cycles - it spaces them: threshold = 75% of (target -
+// live) = 3x live of allocation between cycles at 400%.  The physical heap
+// still cannot ratchet past target*1.25/+16MB (GetFreeBlock's growLimit), so
+// the O(heap) pauses stay bounded while the cycle RATE drops.
 int sgTargetFreeSpacePercentage  = 400;
 
 

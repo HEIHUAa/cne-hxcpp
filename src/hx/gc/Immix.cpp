@@ -26,7 +26,68 @@
 #include <stdio.h>
 #include <stdarg.h>
 
+// --- Crash dump on fatal SEH (GC diagnostics) -------------------------------
+// The flaky balloon/frag crashes die as a bare 0xC0000005 with nothing
+// behind them: WER LocalDumps is not honored here and CNE's CrashHandler only
+// sees Haxe-level errors, so every reproduction is unusable.  Install a
+// last-chance SEH filter that writes a full-memory dump when the environment
+// variable GC_CRASH_DUMP_DIR points at a directory.  Nothing changes when the
+// variable is unset, and the filter returns CONTINUE_SEARCH so the original
+// crash behavior (exit code, WER) is preserved.  Re-registered on the first
+// frame tick in case any library replaced the filter during startup.
+#ifdef HX_WINDOWS
+#include <windows.h>
+#include <dbghelp.h>
+#pragma comment(lib, "dbghelp.lib")
+
+static LONG WINAPI GcCrashDumpFilter(EXCEPTION_POINTERS *inInfo)
+{
+   static bool sDumped = false;
+   if (!sDumped)
+   {
+      sDumped = true;
+      const char *dir = getenv("GC_CRASH_DUMP_DIR");
+      if (dir && *dir)
+      {
+         char path[MAX_PATH];
+         snprintf(path, sizeof(path), "%s\\gc-crash-%u.dmp", dir, (unsigned)GetCurrentProcessId());
+         HANDLE file = CreateFileA(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+         if (file != INVALID_HANDLE_VALUE)
+         {
+            MINIDUMP_EXCEPTION_INFORMATION mei;
+            mei.ThreadId = GetCurrentThreadId();
+            mei.ExceptionPointers = inInfo;
+            mei.ClientPointers = FALSE;
+            // Full memory: the interesting state is the block heap itself.
+            MiniDumpWriteDump(GetCurrentProcess(), GetCurrentProcessId(), file,
+               MiniDumpWithFullMemory, &mei, NULL, NULL);
+            CloseHandle(file);
+         }
+      }
+   }
+   return EXCEPTION_CONTINUE_SEARCH;
+}
+
+static void GcRegisterCrashDumpFilter()
+{
+   SetUnhandledExceptionFilter(GcCrashDumpFilter);
+}
+static bool sGcCrashDumpRegistered = (GcRegisterCrashDumpFilter(), true);
+#endif
+
 static bool sgIsCollecting = false;
+
+#ifdef HXCPP_GC_AUDIT
+// Mark-audit parent tracking: while the audit's full mark runs, every
+// object->field edge discovered by the marker records the child's first
+// parent.  The audit then walks this map upwards from each missed object,
+// printing the reference path that kept the object alive - the edge the
+// incremental barrier missed is somewhere on that path.  File scope: both
+// namespace-hx blocks (the allocator helpers and GlobalAllocator) use it.
+static bool sAuditTrackParents = false;
+static std::unordered_map<void *, void *> *sAuditParentMap = 0;
+static std::mutex sAuditParentMapLock;
+#endif
 
 // Frame-driven scheduling state.  Only touched from the main thread.
 static int    sGcFrameCount = 0;
@@ -52,6 +113,12 @@ static double sStwPauseSeconds = 0;
 // without per-cycle logging can still tell how often and how long GC ran.
 static int    sCycleCount = 0;
 static double sCyclePauseTotal = 0;
+// Wall time spent inside stop-the-world Collect() calls in the current pacer
+// window (explicit major/compact collects, including the incremental-cycle
+// close they perform and the shrink scan).  The cycle pauses above only cover
+// the incremental begin/finish pairs, so without this the pacer-idle line
+// under-reports every state-switch clearMajor by its whole collect time.
+static double sCollectStwSeconds = 0;
 // Block capacity when the current/most recent incremental cycle started.
 // Measuring growth in reserved memory - not in "used since the last GC" -
 // keeps the trigger independent of the full collections the application
@@ -289,6 +356,7 @@ enum { gAlwaysMove = false };
 #include <stdio.h>
 #ifdef HXCPP_GC_AUDIT
 #include <unordered_set>
+#include <unordered_map>
 #include <stdarg.h>
 #endif
 
@@ -2079,6 +2147,13 @@ public:
 
     bool isGenerational;
 
+    #ifdef HXCPP_GC_AUDIT
+    // Mark-audit: the object whose __Mark is currently running on this
+    // context.  MarkObjectAlloc records child->parent edges with it so a
+    // missed object can print the reference path the full mark used.
+    hx::Object *mAuditParent;
+    #endif
+
     MarkContext(int inThreadId = -1)
     {
        #ifdef HXCPP_DEBUG
@@ -2088,6 +2163,9 @@ public:
        mThreadId = inThreadId;
        marking = sGlobalChunks.alloc();
 
+       #ifdef HXCPP_GC_AUDIT
+       mAuditParent = 0;
+       #endif
        isGenerational = false;
     }
     ~MarkContext()
@@ -2214,6 +2292,9 @@ public:
                 int n = marking->arrayElements;
                 hx::Object **elems = marking->arrayBase;
                 marking->count = 0;
+                #ifdef HXCPP_GC_AUDIT
+                mAuditParent = 0;
+                #endif
                 MarkObjectArray(elems, n, this);
                 continue;
              }
@@ -2230,7 +2311,14 @@ public:
                 unsigned char &objMark = ((unsigned char *)obj)[HX_ENDIAN_MARK_ID_BYTE];
                 if (objMark & HX_GC_REMEMBERED)
                    objMark &= ~HX_GC_REMEMBERED;
+                #ifdef HXCPP_GC_AUDIT
+                hx::Object *savedParent = mAuditParent;
+                mAuditParent = obj;
+                #endif
                 obj->__Mark(this);
+                #ifdef HXCPP_GC_AUDIT
+                mAuditParent = savedParent;
+                #endif
                 #ifdef HX_MULTI_THREAD_MARKING
                 // Load balance
                 if (sLazyThreads && marking->count>32)
@@ -2285,6 +2373,9 @@ public:
                 int n = marking->arrayElements;
                 hx::Object **elems = marking->arrayBase;
                 marking->count = 0;
+                #ifdef HXCPP_GC_AUDIT
+                mAuditParent = 0;
+                #endif
                 MarkObjectArray(elems, n, this);
                 continue;
              }
@@ -2310,7 +2401,14 @@ public:
                 unsigned char &objMark = ((unsigned char *)obj)[HX_ENDIAN_MARK_ID_BYTE];
                 if (objMark & HX_GC_REMEMBERED)
                    objMark &= ~HX_GC_REMEMBERED;
+                #ifdef HXCPP_GC_AUDIT
+                hx::Object *savedParent = mAuditParent;
+                mAuditParent = obj;
+                #endif
                 obj->__Mark(this);
+                #ifdef HXCPP_GC_AUDIT
+                mAuditParent = savedParent;
+                #endif
                 ioBudget--;
                 if (ioBudget <= 0)
                    return false;
@@ -2506,8 +2604,29 @@ void MarkAllocUnchecked(void *inPtr,hx::MarkContext *__inCtx)
    }
 }
 
+#ifdef HXCPP_GC_AUDIT
+// Mark-audit parent tracking: while the audit's full mark runs, every
+// object->field edge discovered by the marker records the child's first
+// parent.  The audit then walks this map upwards from each missed object,
+// printing the reference path that kept the object alive - the edge the
+// incremental barrier missed is somewhere on that path.  File scope: both
+// namespace-hx blocks (the allocator helpers and GlobalAllocator) use it.
+static bool sAuditTrackParents = false;
+static std::unordered_map<void *, void *> *sAuditParentMap = 0;
+static std::mutex sAuditParentMapLock;
+#endif
+
 void MarkObjectAllocUnchecked(hx::Object *inPtr,hx::MarkContext *__inCtx)
 {
+   #ifdef HXCPP_GC_AUDIT
+   if (sAuditTrackParents && __inCtx->mAuditParent && sAuditParentMap)
+   {
+      std::lock_guard<std::mutex> lock(sAuditParentMapLock);
+      if (!sAuditParentMap->count(inPtr))
+         (*sAuditParentMap)[inPtr] = __inCtx->mAuditParent;
+   }
+   #endif
+
    size_t ptr_i = ((size_t)inPtr)-sizeof(int);
    unsigned int flags =  *((unsigned int *)ptr_i);
    #ifdef HXCPP_GC_NURSERY
@@ -4018,7 +4137,16 @@ public:
          return;
 
       size_t liveRows = LiveBytes() >> IMMIX_LINE_BITS;
-      size_t capRows = GetWorkingMemory() >> IMMIX_LINE_BITS;
+      // The trigger basis is the heap TARGET, not the physical block heap.
+      // GetWorkingMemory() ratchets upward while a cycle grows the heap
+      // (MMTk's ConcurrentImmix triggers against total_pages, which its
+      // MemBalancer bounds), so a bigger heap kept pushing the threshold out
+      // - the positive feedback that inflated the block heap to 5x live in
+      // the old logs.  The target only changes at cycle completion, so it is
+      // stable between cycles exactly like MMTk's total_pages between GCs.
+      // If live ever exceeds the target, the subtraction below would wrap,
+      // so clamp to "trigger at the minimum" instead (heap pressure).
+      size_t targetRows = sWorkingMemorySize >> IMMIX_LINE_BITS;
       // Trigger when the allocation SINCE THE LAST GC COMPLETED has consumed
       // 75% of the free capacity that existed at that point, leaving 25% as
       // proportional headroom for the concurrent marker.  sRowsSinceCycle is
@@ -4035,7 +4163,7 @@ public:
       // with headroom, so tripling their frequency tripled the outliers,
       // including a 28.5ms finish drain when a burst collided with a cycle
       // closing during a marker budget slice.
-      size_t thresholdRows = ((capRows - liveRows) * 3) >> 2;
+      size_t thresholdRows = targetRows > liveRows ? ((targetRows - liveRows) * 3) >> 2 : 0;
       size_t minRows = (size_t)(8<<20) >> IMMIX_LINE_BITS;
       if (thresholdRows < minRows)
          thresholdRows = minRows;
@@ -4044,8 +4172,9 @@ public:
 
       sHeapAtCycleStart = GetWorkingMemory();
       if (BeginIncremental())
-         GCPerfLog("pacer-poll threshold=%d live=%d heap=%d target=%d",
-            (int)thresholdRows, (int)LiveBytes(), (int)sHeapAtCycleStart, (int)sWorkingMemorySize);
+         GCPerfLog("pacer-poll threshold=%d(%dMB) live=%d heap=%d target=%d",
+            (int)thresholdRows, (int)((thresholdRows << IMMIX_LINE_BITS) >> 20),
+            (int)LiveBytes(), (int)sHeapAtCycleStart, (int)sWorkingMemorySize);
    }
 
    BlockDataInfo *GetFreeBlock(int inRequiredBytes, hx::ImmixAllocator *inAlloc)
@@ -4094,9 +4223,12 @@ public:
          // An incremental cycle has no reclaimed rows yet, so let the heap
          // grow a little past its target - but only a little.  Growing
          // without a bound turns every long cycle into a larger heap, and
-         // the next stop-the-world collection then has to scan it all.
-         size_t growLimit = sWorkingMemorySize + (sWorkingMemorySize >> 1);
-         size_t growCap = sWorkingMemorySize + (64<<20);
+         // the next stop-the-world collection then has to scan it all.  At
+         // 3.5x live (target) the free rows held by the sweep cover the
+         // cycle's allocation, so this valve rarely opens; when it does,
+         // the frag-finish path closes the cycle instead of growing further.
+         size_t growLimit = sWorkingMemorySize + (sWorkingMemorySize >> 2);
+         size_t growCap = sWorkingMemorySize + (16<<20);
          if (growLimit > growCap)
             growLimit = growCap;
          bool incrementalGrow = hx::gIncrementalMarking && GetWorkingMemory()<growLimit;
@@ -5559,6 +5691,11 @@ public:
 
    void Collect(bool inMajor, bool inForceCompact, bool inLocked,bool inFreeIsFragged)
    {
+      // Timed from the call so the cycle-close spin below is included: it
+      // stalls the calling thread exactly like the collect itself.  Early
+      // returns (redirect to incremental, another collector running) never
+      // reach the accumulator, so they do not pollute the count.
+      double tCollectCall = __hxcpp_time_stamp();
       // An incremental cycle owns the heap until it ends.  A collection
       // request arriving now means the allocator is out of rows (or external
       // memory grew), so close the cycle instead of returning without doing
@@ -6188,6 +6325,7 @@ public:
       backgroundProcessFreeList(true);
 
       double tCollectFree = __hxcpp_time_stamp();
+      sCollectStwSeconds += tCollectFree - tCollectCall;
       GCPerfLog("collect total=%.3f mark=%.3f reclaim=%.3f large=%.3f stats=%.3f freelist=%.3f used=%d blocks=%d",
          (tCollectFree-tCollectEnter)*1000, (tCollectMarked-tCollectEnter)*1000,
          (tCollectReclaimed-tCollectMarked)*1000, (tCollectLarge-tCollectReclaimed)*1000,
@@ -6307,6 +6445,22 @@ public:
       #else
       return true;
       #endif
+   }
+
+   // Reads the class name of an object with the same safety rules the audit's
+   // missed-object printer uses (vtable + class pointer must look mapped).
+   static const char *AuditClassName(hx::Object *obj)
+   {
+      const char *name = "?";
+      if (!obj || !AuditLooksMapped(obj))
+         return name;
+      void **vtable = *(void ***)obj;
+      if (!AuditLooksMapped(vtable))
+         return name;
+      hx::Class cls = obj->__GetClass();
+      if (cls.GetPtr() && AuditLooksMapped(cls.GetPtr()))
+         name = cls->mName.raw_ptr();
+      return name;
    }
 
    // Collect the addresses of every object currently carrying the live mark,
@@ -6705,14 +6859,35 @@ public:
       #ifdef HXCPP_GC_AUDIT
       // Limit > 0 replaces the finish mark with a full mark and compares the
       // two sets.  Zero runs the plain incremental finish.
-      static int sAuditCycleLimit = 3;
+      // Dormant unless HXCPP_GC_AUDIT_LIMIT is set (number of cycles to
+      // audit from process start) - e.g. a large value runs the compare
+      // through the balloon iterations, where the frag/lifetime corruption
+      // actually reproduces.  Zero keeps the plain incremental finish, so
+      // builds with the audit compiled in behave normally.
+      static int sAuditCycleLimit = -1;
+      if (sAuditCycleLimit < 0)
+      {
+         const char *lim = getenv("HXCPP_GC_AUDIT_LIMIT");
+         sAuditCycleLimit = lim && *lim ? atoi(lim) : 0;
+      }
       static int sAuditCycles = 0;
       if (sAuditCycles < sAuditCycleLimit)
       {
          sAuditCycles++;
          std::unordered_set<void*> before;
          AuditCollectMarked(before);
+         // Track child->parent edges while the full mark runs, so missed
+         // objects can print the reference path that kept them alive.
+         {
+            std::lock_guard<std::mutex> lock(sAuditParentMapLock);
+            if (!sAuditParentMap)
+               sAuditParentMap = new std::unordered_map<void *, void *>();
+            else
+               sAuditParentMap->clear();
+         }
+         sAuditTrackParents = true;
          MarkAll(false);
+         sAuditTrackParents = false;
          std::unordered_set<void*> after;
          AuditCollectMarked(after);
 
@@ -6741,6 +6916,26 @@ public:
                   }
                }
                fprintf(audit, "missed %p %s\n", *it, name);
+               // Walk the full-mark reference path upwards: the edge that the
+               // incremental barrier missed sits somewhere on this chain.
+               void *cur = *it;
+               for(int hop=0; hop<8 && cur; hop++)
+               {
+                  void *parent = 0;
+                  {
+                     std::lock_guard<std::mutex> lock(sAuditParentMapLock);
+                     auto pit = sAuditParentMap->find(cur);
+                     if (pit != sAuditParentMap->end())
+                        parent = pit->second;
+                  }
+                  if (!parent)
+                  {
+                     fprintf(audit, "   via (root/stack/header)\n");
+                     break;
+                  }
+                  fprintf(audit, "   via %p %s\n", parent, AuditClassName((hx::Object *)parent));
+                  cur = parent;
+               }
             }
             fprintf(audit, "cycle %d: before=%d after=%d missed=%d\n",
                sAuditCycles, (int)before.size(), (int)after.size(), missing);
@@ -8971,17 +9166,30 @@ static void IncrMarkThreadProc()
 // --- Frame-driven collection scheduling ------------------------------------
 //
 // The haxe side calls this once per frame, from the main thread.  The throttle
-// follows the two mechanisms MMTk uses for concurrent Immix: the trigger point
-// is relative to the heap size (ConcurrentImmix starts marking once half of
-// the heap has been allocated), and the heap target comes from MemBalancer
-// (see FinishIncrementalSweepList).  Nothing here is tied to a particular
-// frame rate or content size.
+// follows the shape MMTk's ConcurrentImmix uses: the trigger point is relative
+// to the heap TARGET (ConcurrentImmix triggers against total_pages once half
+// of it has been allocated; here PollIncremental triggers against
+// sWorkingMemorySize), and the target itself is the live-set percentage policy
+// recomputed at cycle completion (see FinishIncrementalSweepList).  MMTk's
+// MemBalancer feedback (the sGcTimeRatioEma measured in FinishIncremental-
+// SweepList) is intentionally NOT wired into the target: its raw sizing is
+// only a few MB of headroom for a game's allocation rate and would collect
+// several times per second.  Nothing here is tied to a particular frame rate
+// or content size.
 
 bool __hxcpp_gc_frame_tick(int inBudgetMicros, bool inAllowFull, double inFrameMs)
 {
    (void)inAllowFull;
 
    sGcFrameCount++;
+
+   #ifdef HX_WINDOWS
+   // Re-arm the crash-dump filter on the first real frame: if any library
+   // replaced the unhandled-exception filter during startup, the last one
+   // registered wins, and gameplay must not crash without a dump.
+   if (sGcFrameCount == 1)
+      GcRegisterCrashDumpFilter();
+   #endif
 
    // Track the frame time.  The budget follows the fastest recent frame:
    // scaling it with the current frame would make an already slow frame pay
@@ -9053,10 +9261,11 @@ bool __hxcpp_gc_frame_tick(int inBudgetMicros, bool inAllowFull, double inFrameM
    if (now - sLastPacerLog >= 30.0)
    {
       sLastPacerLog = now;
-      GCPerfLog("pacer-idle frame=%d frameMs=%.2f rowsSince=%d live=%d cap=%d target=%d budget=%d cycles=%d pauseTotal=%.1fms",
+      GCPerfLog("pacer-idle frame=%d frameMs=%.2f rowsSince=%d live=%d cap=%d target=%d budget=%d cycles=%d pauseTotal=%.1fms collectStw=%.1fms",
          sGcFrameCount, sFrameTimeEmaMs, (int)sRowsSinceCycle,
          (int)sGlobalAlloc->LiveBytes(), (int)sGlobalAlloc->GetWorkingMemory(),
-         (int)sWorkingMemorySize, budget, sCycleCount, sCyclePauseTotal*1000.0);
+         (int)sWorkingMemorySize, budget, sCycleCount, sCyclePauseTotal*1000.0,
+         sCollectStwSeconds*1000.0);
       GCPerfLog("gc-phases n=%d cycle max=%.3fms avg=%.3fms | begin wait=%.3f setup=%.3f roots=%.3f alloc=%.3f total=%.3f | finish wait=%.3f drain=%.3f roots=%.3f mark=%.3f zomb=%.3f weak=%.3f final=%.3f sweep=%.3f total=%.3f",
          sGcPhases.cycles,
          sGcPhases.cycleMax*1000.0,
@@ -9070,6 +9279,7 @@ bool __hxcpp_gc_frame_tick(int inBudgetMicros, bool inAllowFull, double inFrameM
          sGcPhases.finishFinal*1000.0, sGcPhases.finishSweep*1000.0,
          sGcPhases.finishTotal*1000.0);
       sGcPhases.reset();
+      sCollectStwSeconds = 0;
    }
    return false;
 }

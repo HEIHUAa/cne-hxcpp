@@ -14,6 +14,28 @@
 // an incremental cycle actually starts (gIncrementalMarking).
 #define HXCPP_GC_INCREMENTAL
 
+// The mark-audit compare (gc_audit.log) mirrors the incremental switch: a
+// project.xml haxedef does not reach this compile line, so it is defined
+// here.  The audit stays dormant unless the environment sets
+// HXCPP_GC_AUDIT_LIMIT, so compiling it in costs nothing at runtime.
+#ifndef HXCPP_GC_AUDIT
+#define HXCPP_GC_AUDIT
+#endif
+
+// The nursery's per-collection bump-reset semantics were designed for the
+// generational barrier; under the incremental marker nursery allocations are
+// "white" (no mark id), and BeginIncremental's ClearPooledAlloc reset can
+// recycle the rows of live nursery objects before the marker reaches them.
+// Evidence (hang.dmp / gc-crash-13808.dmp): a live FunkinShader - mark byte
+// == current gByteMarkID - still held a reclaimed FlxSignal at +0x248 whose
+// object header had been overwritten by hammer strings, while the mark audit
+// reported missed=0 for every cycle.  hxcpp.h auto-defines the nursery from
+// the HXCPP-GC-GENERATIONAL haxedef, so it is force-disabled here for the
+// incremental scheme; project.xml's nursery switch cannot prevent this.
+#ifdef HXCPP_GC_NURSERY
+#undef HXCPP_GC_NURSERY
+#endif
+
 #include <hx/Tls.h>
 #include <stdio.h>
 
