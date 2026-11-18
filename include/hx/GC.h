@@ -39,6 +39,12 @@ HXCPP_EXTERN_CLASS_ATTRIBUTES double __hxcpp_gc_mem_info(int inWhat);
 HXCPP_EXTERN_CLASS_ATTRIBUTES void  __hxcpp_enter_gc_free_zone();
 HXCPP_EXTERN_CLASS_ATTRIBUTES void  __hxcpp_exit_gc_free_zone();
 HXCPP_EXTERN_CLASS_ATTRIBUTES void  __hxcpp_gc_safe_point();
+// GC safepoint for the frame loop: runs a pending proactive collection at a
+// frame boundary (in the frame-pacer dead time) instead of stalling an
+// allocation mid-frame.  Cheap no-op when nothing is pending.  extern "C"
+// so the frame loop (lime's ndll) can GetProcAddress it from the exe by the
+// plain name.
+extern "C" HXCPP_EXTERN_CLASS_ATTRIBUTES void  __hxcpp_gc_yieldpoint();
 HXCPP_EXTERN_CLASS_ATTRIBUTES void  __hxcpp_spam_collects(int inEveryNCalls);
 HXCPP_EXTERN_CLASS_ATTRIBUTES void  __hxcpp_set_minimum_working_memory(int inBytes);
 HXCPP_EXTERN_CLASS_ATTRIBUTES void  __hxcpp_set_minimum_free_space(int inBytes);

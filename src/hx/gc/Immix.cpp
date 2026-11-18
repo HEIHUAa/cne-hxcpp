@@ -245,6 +245,14 @@ int gInAlloc = false;
 // This is recalculated from the other parameters
 static size_t sWorkingMemorySize = 256*1024;
 
+// Proactive GC safepoint: when the heap crosses 60% of its target, the frame
+// loop's __hxcpp_gc_yieldpoint (see lime's SDLApplication::Update) runs the
+// next collection at a frame boundary - in the pacer's dead time - instead of
+// stalling an allocation mid-frame.  The hard in-allocation collect remains
+// as the fallback for bursts that outrun the frame boundaries.
+static volatile int sGcSoftPending = 0;
+static size_t sSoftTriggerRows = 0;
+
 #ifdef HXCPP_GC_MOVING
 // Just not sure what this shold be
 static size_t sgMaximumFreeSpace = 1024*1024*1024;
@@ -1676,7 +1684,11 @@ struct GlobalChunks
       _hx_atomic_add(&sThreadChunkPushCount, 1);
       #endif
 
-      if (MAX_GC_THREADS>1 && sLazyThreads)
+      // Wake check runs unconditionally (a stale sLazyThreads here would miss
+      // a thread that just completed, orphaning this job - see the final
+      // processList re-check in popJobOrFinish).  Waking when nobody sleeps
+      // is a cheap no-op: SignalThreadPool only notifies sleepers.
+      if (MAX_GC_THREADS>1)
       {
          std::lock_guard<std::mutex> l(sThreadPoolLock);
 
@@ -1853,6 +1865,17 @@ struct GlobalChunks
                }
             }
             std::lock_guard<std::mutex> l(sThreadPoolLock);
+            // Last chance before completing: a worker may have pushed a split
+            // job (takeArrayJob) between the unlocked spin check and this
+            // lock.  Taking the job here keeps it from being orphaned - an
+            // unprocessed range means unmarked objects, which the next sweep
+            // frees while the owning array keeps the dangling pointers.
+            if (processList && !sgThreadPoolAbort)
+            {
+               result = popJobLocked(0);
+               if (result)
+                  return result;
+            }
             completeThreadLocked(inThreadId);
          }
          return result;
@@ -2049,6 +2072,15 @@ public:
              if (sgThreadPoolAbort)
              {
                 releaseJobs();
+                // Mirror popJobOrFinish's bookkeeping: without completing the
+                // thread here it would go back to waitForThreadWake with its
+                // sRunningThreads bit still set, and StopThreadJobs would wait
+                // for it forever (the major-abort hang).
+                if (mThreadId>=0 && sAllThreads)
+                {
+                   std::lock_guard<std::mutex> l(sThreadPoolLock);
+                   sGlobalChunks.completeThreadLocked(mThreadId);
+                }
                 return;
              }
              #endif
@@ -2198,10 +2230,17 @@ void MarkAllocUnchecked(void *inPtr,hx::MarkContext *__inCtx)
                                           (size<<IMMIX_ALLOC_SIZE_SHIFT) |
                                           gMarkID;
 
+         unsigned int startFlag = gImmixStartFlag[start&127];
          unsigned int *pos = info->allocStart + startRow;
-         unsigned int val = *pos;
-         while(_hx_atomic_compare_exchange((volatile int *)pos, val,val|gImmixStartFlag[start&127]) != val)
-            val = *pos;
+         // Most markings hit a slot that is already recorded; skipping the
+         // atomic here removes the cache-line contention between the marker
+         // threads, which is what the parallel phase spends its time on.
+         if (!(*pos & startFlag))
+         {
+            unsigned int val = *pos;
+            while(_hx_atomic_compare_exchange((volatile int *)pos, val,val|startFlag) != val)
+               val = *pos;
+         }
 
          #ifdef HXCPP_GC_GENERATIONAL
          info->mHasSurvivor = true;
@@ -2283,10 +2322,17 @@ void MarkObjectAllocUnchecked(hx::Object *inPtr,hx::MarkContext *__inCtx)
                                        (size<<IMMIX_ALLOC_SIZE_SHIFT) |
                                        gMarkID;
 
+      unsigned int startFlag = gImmixStartFlag[start&127];
       unsigned int *pos = info->allocStart + startRow;
-      unsigned int val = *pos;
-      while(_hx_atomic_compare_exchange( (volatile int *)pos, val, val|gImmixStartFlag[start&127]) != val)
-         val = *pos;
+      // Most markings hit a slot that is already recorded; skipping the
+      // atomic here removes the cache-line contention between the marker
+      // threads, which is what the parallel phase spends its time on.
+      if (!(*pos & startFlag))
+      {
+         unsigned int val = *pos;
+         while(_hx_atomic_compare_exchange( (volatile int *)pos, val, val|startFlag) != val)
+            val = *pos;
+      }
       #ifdef HXCPP_GC_GENERATIONAL
       info->mHasSurvivor = true;
       #endif
@@ -3714,6 +3760,11 @@ public:
 
    BlockDataInfo *GetFreeBlock(int inRequiredBytes, hx::ImmixAllocator *inAlloc)
    {
+      // Proactive safepoint trigger: heap past 60% of its target -> the frame
+      // loop collects at the next frame boundary.
+      if (!sGcSoftPending && sSoftTriggerRows && mCurrentRowsInUse > sSoftTriggerRows)
+         sGcSoftPending = 1;
+
       while(true)
       {
          BlockDataInfo *result = GetNextFree(inRequiredBytes);
@@ -5338,6 +5389,7 @@ public:
             size_t targetFree = std::max((size_t)hx::sgMinimumFreeSpace, mem/100 * (size_t)hx::sgTargetFreeSpacePercentage );
             targetFree = std::min(targetFree, (size_t)sgMaximumFreeSpace );
             sWorkingMemorySize = std::max( mem + targetFree, (size_t)hx::sgMinimumWorkingMemory);
+            sSoftTriggerRows = (sWorkingMemorySize>>IMMIX_LINE_BITS)*3/5;
 
             size_t allMem = GetWorkingMemory();
             // 8 Meg too much?
@@ -5446,7 +5498,10 @@ public:
       targetFree = std::min(targetFree, (size_t)sgMaximumFreeSpace );
       // Only adjust if non-generational
       if (!generational)
+      {
          sWorkingMemorySize = std::max( mem + targetFree, (size_t)hx::sgMinimumWorkingMemory);
+         sSoftTriggerRows = (sWorkingMemorySize>>IMMIX_LINE_BITS)*3/5;
+      }
 
       #if defined(SHOW_FRAGMENTATION) || defined(SHOW_MEM_EVENTS)
       GCLOG("Target memory %s, using %s\n",  formatBytes(sWorkingMemorySize).c_str(), formatBytes(mem).c_str() );
@@ -7269,6 +7324,29 @@ void __hxcpp_gc_safe_point()
     if (hx::gPauseForCollect)
       hx::PauseForCollect();
 }
+
+
+// GC safepoint for the frame loop (called from lime's SDLApplication::Update,
+// before the start-of-frame sleep+busy-wait): runs a pending proactive
+// collection at a frame boundary - in the pacer's dead time - instead of
+// stalling an allocation mid-frame.  Cheap no-op when nothing is pending.
+void __hxcpp_gc_yieldpoint()
+{
+   if (!sGlobalAlloc || !sgInternalEnable)
+      return;
+
+   int expected = 1;
+   if (_hx_atomic_compare_exchange(&sGcSoftPending, expected, 0) != expected)
+      return;
+
+   CollectFromThisThread(false,false);
+}
+
+// Export for the frame loop (lime's ndll resolves it from the main exe via
+// GetProcAddress at startup).
+#ifdef _MSC_VER
+#pragma comment(linker, "/export:__hxcpp_gc_yieldpoint")
+#endif
 
 //#define HXCPP_FORCE_OBJ_MAP
 
