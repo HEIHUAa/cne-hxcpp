@@ -41,7 +41,7 @@ size_t sgMinimumFreeSpace           = 4*1024*1024;
 // live) = 3x live of allocation between cycles at 400%.  The physical heap
 // still cannot ratchet past target*1.25/+16MB (GetFreeBlock's growLimit), so
 // the O(heap) pauses stay bounded while the cycle RATE drops.
-int sgTargetFreeSpacePercentage  = 400;
+int sgTargetFreeSpacePercentage  = 250;
 
 
 
