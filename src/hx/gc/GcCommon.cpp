@@ -39,7 +39,7 @@ size_t sgMinimumFreeSpace           = 4*1024*1024;
 // old 100% (target 2x live) - fewer stop-the-world pauses at the cost of a
 // larger heap, per the owner's memory-for-smoothness preference.  Mark cost
 // scales with the live set, so the pauses grow only mildly.
-int sgTargetFreeSpacePercentage  = 300;
+int sgTargetFreeSpacePercentage  = 100;
 
 
 
