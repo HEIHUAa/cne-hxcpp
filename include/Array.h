@@ -220,6 +220,36 @@ class HXCPP_EXTERN_CLASS_ATTRIBUTES ArrayCommon : public hx::Object
 // Base class that treats array contents as a slab of bytes.
 // The derived "Array_obj" adds strong typing to the "[]" operator
 
+// Incremental-GC array write barrier.  The generated code appends elements
+// with "resize(n+k)" followed by in-place item writes, and the typed
+// push/insert paths grow the array the same way.  An array the concurrent
+// marker has already walked receives those elements with NO barrier (the
+// generated code carries no HX_OBJ_WB), so the marker never re-visits it:
+// the new element keeps its old mark id, the sweep frees it while the
+// array still references it, and the next cycle crashes on the recycled
+// memory (the Hash::find / Hash::__Mark poison crashes under the balloon).
+// Record the array the same way Hash.h's TSet does - the worker that picks
+// the chunk up re-walks it and marks the new contents.
+static inline void ArrayEnsureSizeWriteBarrier(const void *inArray)
+{
+   if (::hx::GcEnvFlagCached("HXCPP_ASSIGN_BARRIER_OFF"))
+      return;
+   // Same native-thread rule as ObjectAssignWriteBarrier: no GC context
+   // means no GC metadata writes at all.
+   hx::StackContext *__wbCtx = HX_CTX_GET;
+   if (!__wbCtx)
+      return;
+   if (::hx::gIncrementalMarking)
+   {
+      unsigned char &mark = ((unsigned char *)inArray)[HX_ENDIAN_MARK_ID_BYTE];
+      if (mark == ::hx::gByteMarkID)
+      {
+         mark |= HX_GC_REMEMBERED;
+         __wbCtx->pushReferrer((hx::Object *)inArray);
+      }
+   }
+}
+
 class HXCPP_EXTERN_CLASS_ATTRIBUTES ArrayBase : public ArrayCommon
 {
 public:
@@ -418,15 +448,16 @@ public:
 
    void Realloc(int inLen) const;
 
-   inline void EnsureSize(int inLen) const
-   {
-      if (inLen>length)
-      {
-         if (inLen>mAlloc)
-            Realloc(inLen);
-         length = inLen;
-      }
-   }
+    inline void EnsureSize(int inLen) const
+    {
+       if (inLen>length)
+       {
+          ArrayEnsureSizeWriteBarrier(this);
+          if (inLen>mAlloc)
+             Realloc(inLen);
+          length = inLen;
+       }
+    }
 
    void RemoveElement(int inIndex);
 

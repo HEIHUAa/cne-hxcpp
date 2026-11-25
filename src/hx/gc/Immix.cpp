@@ -40,29 +40,29 @@
 #include <dbghelp.h>
 #pragma comment(lib, "dbghelp.lib")
 
+static void GCPerfLog(const char *inFormat, ...);
+
 static LONG WINAPI GcCrashDumpFilter(EXCEPTION_POINTERS *inInfo)
 {
-   static bool sDumped = false;
-   if (!sDumped)
+   // NO one-shot cap: the engine installs its own handler after ours
+   // (SetUnhandledExceptionFilter - last call wins), so an early benign
+   // exception must not consume our only shot.  Dumps overwrite by name.
+   const char *dir = getenv("GC_CRASH_DUMP_DIR");
+   if (dir && *dir)
    {
-      sDumped = true;
-      const char *dir = getenv("GC_CRASH_DUMP_DIR");
-      if (dir && *dir)
+      char path[MAX_PATH];
+      snprintf(path, sizeof(path), "%s\\gc-crash-%u.dmp", dir, (unsigned)GetCurrentProcessId());
+      HANDLE file = CreateFileA(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+      if (file != INVALID_HANDLE_VALUE)
       {
-         char path[MAX_PATH];
-         snprintf(path, sizeof(path), "%s\\gc-crash-%u.dmp", dir, (unsigned)GetCurrentProcessId());
-         HANDLE file = CreateFileA(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-         if (file != INVALID_HANDLE_VALUE)
-         {
-            MINIDUMP_EXCEPTION_INFORMATION mei;
-            mei.ThreadId = GetCurrentThreadId();
-            mei.ExceptionPointers = inInfo;
-            mei.ClientPointers = FALSE;
-            // Full memory: the interesting state is the block heap itself.
-            MiniDumpWriteDump(GetCurrentProcess(), GetCurrentProcessId(), file,
-               MiniDumpWithFullMemory, &mei, NULL, NULL);
-            CloseHandle(file);
-         }
+         MINIDUMP_EXCEPTION_INFORMATION mei;
+         mei.ThreadId = GetCurrentThreadId();
+         mei.ExceptionPointers = inInfo;
+         mei.ClientPointers = FALSE;
+         // Full memory: the interesting state is the block heap itself.
+         MiniDumpWriteDump(GetCurrentProcess(), GetCurrentProcessId(), file,
+            MiniDumpWithFullMemory, &mei, NULL, NULL);
+         CloseHandle(file);
       }
    }
    return EXCEPTION_CONTINUE_SEARCH;
@@ -73,6 +73,40 @@ static void GcRegisterCrashDumpFilter()
    SetUnhandledExceptionFilter(GcCrashDumpFilter);
 }
 static bool sGcCrashDumpRegistered = (GcRegisterCrashDumpFilter(), true);
+
+// Diagnostic dump without an exception: called on detected anomalies (the
+// weakfin spikes before the scene-switch crashes).  Full memory, tagged.
+static int sDiagDumpCount = 0;
+static void GcWriteDiagnosticDump(const char *inTag)
+{
+   if (sDiagDumpCount >= 2)
+      return;
+   sDiagDumpCount++;
+   const char *dir = getenv("GC_CRASH_DUMP_DIR");
+   if (!dir || !*dir)
+      return;
+   char path[MAX_PATH];
+   snprintf(path, sizeof(path), "%s\\gc-diag-%s-%d.dmp", dir, inTag, sDiagDumpCount);
+   HANDLE file = CreateFileA(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+   if (file == INVALID_HANDLE_VALUE)
+      return;
+   MiniDumpWriteDump(GetCurrentProcess(), GetCurrentProcessId(), file,
+      MiniDumpWithFullMemory, NULL, NULL, NULL);
+   CloseHandle(file);
+   GCPerfLog("DIAG-DUMP written: %s", path);
+}
+
+// The engine's own crash handler (CrashOverlay) registers via
+// SetUnhandledExceptionFilter AFTER the GC init and replaces ours.  The
+// engine calls this once from its first tick so our filter is the last one
+// installed and the dumps actually land.
+namespace hx
+{
+void __hxcpp_gc_reinstall_dump_filter()
+{
+   GcRegisterCrashDumpFilter();
+}
+}
 #endif
 
 static bool sgIsCollecting = false;
@@ -82,11 +116,18 @@ static bool sgIsCollecting = false;
 // object->field edge discovered by the marker records the child's first
 // parent.  The audit then walks this map upwards from each missed object,
 // printing the reference path that kept the object alive - the edge the
-// incremental barrier missed is somewhere on that path.  File scope: both
-// namespace-hx blocks (the allocator helpers and GlobalAllocator) use it.
+// incremental barrier missed is somewhere on that path.  This is THE single
+// copy (global namespace, visible inside namespace hx too - the hx block
+// must not shadow it, see the comment at MarkObjectAllocUnchecked).
 static bool sAuditTrackParents = false;
 static std::unordered_map<void *, void *> *sAuditParentMap = 0;
 static std::mutex sAuditParentMapLock;
+static int sAuditEdges = 0;
+// Objects whose mark byte did not match the cycle id when the before-set
+// was collected - the missed objects come out of this set, and their
+// recorded byte says whether they were born last cycle (never re-walked)
+// or older (never marked at all).
+static std::unordered_map<void *, unsigned char> *sBeforeBytes = 0;
 #endif
 
 // Frame-driven scheduling state.  Only touched from the main thread.
@@ -286,6 +327,10 @@ static void GCDeferredFreeThreadProc()
 
 static void QueueGCFree(void *inPtr, bool inIsBlock)
 {
+   // Bisection: HXCPP_NO_DEFERRED_FREE=1 leaks instead of async-freeing, to
+   // test whether the deferred-free worker frees still-referenced memory.
+   if (::hx::GcEnvFlagCached("HXCPP_NO_DEFERRED_FREE"))
+      return;
    {
       std::lock_guard<std::mutex> l(sgFreeLock);
       GCDeferredFree item;
@@ -738,6 +783,40 @@ unsigned int gImmixStartFlag[128];
 int gMarkID = 0x10 << 24;
 int gMarkIDWithContainer = (0x10 << 24) | IMMIX_ALLOC_IS_CONTAINER;
 
+// The exe image range, populated lazily (see GcExeImageRange).  Strings can
+// adopt raw pointers into it (static literals); marking them would stamp the
+// read-only .rdata page.
+unsigned char *gExeImageBase = 0;
+unsigned char *gExeImageEnd = 0;
+unsigned char *gBlockRegionLow = 0;
+unsigned char *gBlockRegionHigh = 0;
+
+static void GcExeImageRange()
+{
+   if (gExeImageBase)
+      return;
+   HMODULE mod = GetModuleHandleA(0);
+   if (!mod)
+      return;
+   unsigned char *base = (unsigned char *)mod;
+   IMAGE_DOS_HEADER *dos = (IMAGE_DOS_HEADER *)base;
+   if (dos->e_magic != IMAGE_DOS_SIGNATURE)
+      return;
+   IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)(base + dos->e_lfanew);
+   if (nt->Signature != IMAGE_NT_SIGNATURE)
+      return;
+   gExeImageBase = base;
+   gExeImageEnd = base + nt->OptionalHeader.SizeOfImage;
+}
+
+// Stamped-this-cycle id (see the comment in GC.h): born allocations and
+// assign-barrier stamps carry 0x30-prefixed ids.  The low nibble mirrors the
+// current cycle's so the next cycle's sweep frees stamped garbage (the
+// nibble advances every cycle, so a stamped object only survives the sweep
+// of the cycle it was stamped in).
+int gStampMarkID = 0x30 << 24;
+int gStampByteMarkID = 0x30;
+
 int gPrevByteMarkID = 0x2f;
 unsigned int gPrevMarkIdMask = ((~0x2f000000) & 0x30000000) | HX_GC_CONST_ALLOC_BIT;
 
@@ -1040,6 +1119,18 @@ static int gBlockInfoEmptySlots = 0;
     #define ALIGN_PADDING(x) 0
 #endif
 
+// Rows healed by reclaim's self-heal: the stamps for this-cycle allocations
+// can be lost between the marking and the sweep (~2000 rows/cycle, mechanism
+// unidentified - async-zero, shrink, deferred-free, frag-finish and the
+// barriers were all ruled out by switch bisection).  Reclaim re-marks any
+// hole row that still holds a this-cycle allocation instead of freeing it.
+static int sRowsHealed = 0;
+static int sRowsHealedSpan = 0;
+static int sRowsHealedSpanLogged = 0;
+static int sRowsHealedLogged = 0;
+static int sRowClearLogged = 0;
+static int sLargeGraceSavedLogged = 0;
+
 struct BlockDataInfo
 {
    int             mId;
@@ -1147,6 +1238,18 @@ struct BlockDataInfo
    void clearRowMarks()
    {
       clearBlockMarks();
+      // Canary accounting: count the marks being wiped so the log shows
+      // which blocks the begin clears (and how many marks existed there -
+      // a block whose marks were already gone never appears here).
+      int had = 0;
+      unsigned char *marks = (unsigned char *)mPtr + IMMIX_HEADER_LINES;
+      for(int r=0;r<IMMIX_USEFUL_LINES;r++)
+         had += marks[r];
+      if (had > 50 && sRowClearLogged < 40)
+      {
+         sRowClearLogged++;
+         GCPerfLog("CLEAR-MARKS block=%d wiping=%d", mId, had);
+      }
       ZERO_MEM((char *)mPtr+IMMIX_HEADER_LINES, IMMIX_USEFUL_LINES);
    }
 
@@ -1163,7 +1266,28 @@ struct BlockDataInfo
             reclaim<false>(0);
 
          for(int i=0;i<mHoles;i++)
-             ZERO_MEM( (char *)mPtr+mRanges[i].start, mRanges[i].length );
+         {
+            // ZERO-GUARD: the hole bytes are about to be zeroed.  A nonzero
+            // allocStart word in a hole row means the reclaim handed out rows
+            // that the allocator bookkeeping still believes are allocated
+            // (the double-handout the begin-time ClearPooledAlloc guards
+            // against) - zeroing would destroy a live allocation.
+            static int sZeroGuardLogged = 0;
+            if (sZeroGuardLogged < 40)
+            {
+               int rs = mRanges[i].start>>IMMIX_LINE_BITS;
+               int re = (mRanges[i].start + mRanges[i].length + (IMMIX_LINE_LEN-1))>>IMMIX_LINE_BITS;
+               for(int r=rs; r<re && sZeroGuardLogged<40; r++)
+               {
+                  if (allocStart[r])
+                  {
+                     sZeroGuardLogged++;
+                     GCPerfLog("ZERO-GUARD nonzero allocStart row=%d bits=%08x", r, allocStart[r]);
+                  }
+               }
+            }
+            ZERO_MEM( (char *)mPtr+mRanges[i].start, mRanges[i].length );
+         }
          mZeroed = ZEROED_THREAD;
       }
       mZeroLock = 0;
@@ -1193,6 +1317,26 @@ struct BlockDataInfo
 
    bool isEmpty() const { return mUsedRows == 0; }
    int getUsedRows() const { return mUsedRows; }
+
+   // Authoritative "may hold live data" check for group-release decisions:
+   // mUsedRows is stale for blocks the allocator owned across a sweep (the
+   // sweep skips owned blocks without updating the counters) and for blocks
+   // handed back after the sweep, so isEmpty()==0 there is wrong.  The
+   // allocStart bits are written at every allocation and only cleared for
+   // rows the sweep actually freed, so a nonzero bit means the row may hold
+   // a live allocation.  Releasing a group whose block holds such bits
+   // decommits live data (the "https:/"-slot / decommitted-pointer crash
+   // family).
+   bool mayHoldLiveData() const
+   {
+      if (mUsedRows > 0 || mOwned)
+         return true;
+      const unsigned int *as = allocStart + IMMIX_HEADER_LINES;
+      for(int r=0;r<IMMIX_USEFUL_LINES;r++)
+         if (as[r])
+            return true;
+      return false;
+   }
 
    void getStats(BlockDataStats &outStats)
    {
@@ -1310,6 +1454,59 @@ struct BlockDataInfo
 
       unsigned char *rowMarked = mPtr->mRowMarked;
 
+      // SPAN-HEAL: derive the expected row coverage from the allocation
+      // starts + headers, independent of rowMarked.  The existing self-heal
+      // only sees rows that carry their OWN allocStart bit - a start row.
+      // A live multi-row object whose MIDDLE rows lost their stamps has no
+      // allocStart there, so the sweep freed the row and handed it out while
+      // the object header still claimed the span (the pointer-slot-contains-
+      // string-data crash family).  Every live object carries an allocStart
+      // bit from its birth and its row count in the header, so the union of
+      // the live spans covers every row a correct sweep must keep.  Heal any
+      // row the spans claim but whose stamp is gone; retention is bounded by
+      // the usual 1/16-cycle-id collision exposure of the header check.
+      {
+         unsigned char covered[IMMIX_LINES];
+         memset(covered, 0, sizeof(covered));
+         for(int sr=IMMIX_HEADER_LINES; sr<IMMIX_LINES; sr++)
+         {
+            unsigned int starts = allocStart[sr];
+            if (!starts)
+               continue;
+            unsigned int *headers = (unsigned int *)mPtr->mRow[sr];
+            for(int i=0;i<32;i++)
+            {
+               if (!(starts & (1u<<i)))
+                  continue;
+               unsigned int hdr = headers[i];
+               unsigned int id = hdr & IMMIX_ALLOC_MARK_ID;
+               if (id!=hx::gMarkID && id!=hx::gStampMarkID)
+                  continue;
+               int rows = hdr & IMMIX_ALLOC_ROW_COUNT;
+               if (rows<=0)
+                  continue;
+               if (sr+rows>IMMIX_LINES)
+                  rows = IMMIX_LINES-sr;
+               for(int k=0;k<rows;k++)
+                  covered[sr+k] = 1;
+            }
+         }
+         for(int sr=IMMIX_HEADER_LINES; sr<IMMIX_LINES; sr++)
+         {
+            if (covered[sr] && !rowMarked[sr])
+            {
+               rowMarked[sr] = 1;
+               sRowsHealedSpan++;
+               if (sRowsHealedSpanLogged < 40)
+               {
+                  sRowsHealedSpanLogged++;
+                  GCPerfLog("ROW-HEAL-SPAN block=%d row=%d startRow=? wiped=%d total=%d",
+                     mId, sr, sRowsHealedSpanLogged, sRowsHealedSpan);
+               }
+            }
+         }
+      }
+
       int r = IMMIX_HEADER_LINES;
       // Count unused rows ....
      
@@ -1347,56 +1544,136 @@ struct BlockDataInfo
             hole++;
          }
 
+         // Per-row sweep of a marked row: free the stale allocations, count
+         // the live ones.  Shared by the marked path and the self-heal path.
+         // CHECK_FLAG references `starts`/`headerPtr`, which SWEEP_MARKED_ROW
+         // declares before expanding it.
+         #define CHECK_FLAG(i,byteMask) \
+         { \
+            unsigned int mask = 1<<i; \
+            if ( starts & mask ) \
+            { \
+               unsigned int header = headerPtr[i]; \
+               if ( (header & IMMIX_ALLOC_MARK_ID) != hx::gMarkID && \
+                    (header & IMMIX_ALLOC_MARK_ID) != hx::gStampMarkID ) \
+               { \
+                  starts ^= mask; \
+                  if (!(starts & byteMask)) \
+                     break; \
+               } \
+               else \
+                  usedBytes += sizeof(int) + ((header & IMMIX_ALLOC_SIZE_MASK) >> IMMIX_ALLOC_SIZE_SHIFT); \
+            } \
+         }
+
+         #define SWEEP_MARKED_ROW(sweepRow) \
+         { \
+            unsigned int &starts = allocStart[sweepRow]; \
+            if (starts) \
+            { \
+               unsigned int *headerPtr = ((unsigned int *)mPtr->mRow[sweepRow]); \
+ \
+               if (starts & 0x000000ff) \
+                  for(int i=0;i<8;i++) \
+                     CHECK_FLAG(i,0x000000ff); \
+ \
+               if (starts & 0x0000ff00) \
+                  for(int i=8;i<16;i++) \
+                     CHECK_FLAG(i,0x0000ff00); \
+ \
+               if (starts & 0x00ff0000) \
+                  for(int i=16;i<24;i++) \
+                     CHECK_FLAG(i,0x00ff0000); \
+ \
+               if (starts & 0xff000000) \
+                  for(int i=24;i<32;i++) \
+                     CHECK_FLAG(i,0xff000000); \
+            } \
+         }
+
          while(r<IMMIX_LINES)
          {
             if (rowMarked[r])
             {
                if (FULL)
-               {
-                  unsigned int &starts = allocStart[r];
-                  if (starts)
-                  {
-                     unsigned int *headerPtr = ((unsigned int *)mPtr->mRow[r]);
-                     #define CHECK_FLAG(i,byteMask) \
-                     { \
-                        unsigned int mask = 1<<i; \
-                        if ( starts & mask ) \
-                        { \
-                           unsigned int header = headerPtr[i]; \
-                           if ( (header & IMMIX_ALLOC_MARK_ID) != hx::gMarkID ) \
-                           { \
-                              starts ^= mask; \
-                              if (!(starts & byteMask)) \
-                                 break; \
-                           } \
-                           else \
-                              usedBytes += sizeof(int) + ((header & IMMIX_ALLOC_SIZE_MASK) >> IMMIX_ALLOC_SIZE_SHIFT); \
-                        } \
-                     }
-
-                     if (starts & 0x000000ff)
-                        for(int i=0;i<8;i++)
-                           CHECK_FLAG(i,0x000000ff);
-
-                     if (starts & 0x0000ff00)
-                        for(int i=8;i<16;i++)
-                           CHECK_FLAG(i,0x0000ff00);
-
-                     if (starts & 0x00ff0000)
-                        for(int i=16;i<24;i++)
-                           CHECK_FLAG(i,0x00ff0000);
-
-                     if (starts & 0xff000000)
-                        for(int i=24;i<32;i++)
-                           CHECK_FLAG(i,0xff000000);
-                  }
-               }
+                  SWEEP_MARKED_ROW(r);
                r++;
             }
             else
             {
-               int start = r;
-               ranges[hole].start = start;
+               // SELF-HEAL: a hole row that still holds a this-cycle
+               // allocation had its row stamps lost between the marking and
+               // this sweep.  Freeing the row would release live memory (the
+               // recycled hash chains, the zeroed finalizer objects, the
+               // poisoned glyph fields - the whole deterministic crash
+               // family).  Re-mark the row and sweep it as live instead;
+               // conservative retention keeps it one extra cycle.
+               unsigned int healStarts = allocStart[r];
+               bool healed = false;
+               if (healStarts)
+               {
+                  unsigned int *headers = ((unsigned int *)mPtr->mRow[r]);
+                  for(int i=0;i<32;i++)
+                  {
+                     if (!(healStarts & (1u<<i)))
+                        continue;
+                     unsigned int hdr = headers[i];
+                     if ( (hdr & IMMIX_ALLOC_MARK_ID) == hx::gMarkID ||
+                          (hdr & IMMIX_ALLOC_MARK_ID) == hx::gStampMarkID )
+                     {
+                        healed = true;
+                        break;
+                     }
+                  }
+               }
+               if (healed)
+               {
+                  rowMarked[r] = 1;
+                  sRowsHealed++;
+                  if (sRowsHealedLogged < 40)
+                  {
+                     sRowsHealedLogged++;
+                     // Identify the healed rows' first allocation: vtable in
+                     // the exe image -> class name, else the raw header.  The
+                     // healed rows' object classes point at the subsystem the
+                     // stamp-loss mechanism lives in.
+                     for(int i=0;i<32;i++)
+                     {
+                        if (!(healStarts & (1u<<i)))
+                           continue;
+                        unsigned int hdr = ((unsigned int *)mPtr->mRow[r])[i];
+                        void *obj = (void *)(((unsigned int *)mPtr->mRow[r]) + i + 1);
+                        const char *name = "?";
+                        MEMORY_BASIC_INFORMATION mbi;
+                        if (VirtualQuery(obj, &mbi, sizeof(mbi)) &&
+                            mbi.State == MEM_COMMIT &&
+                            !(mbi.Protect & (PAGE_GUARD|PAGE_NOACCESS)) &&
+                            mbi.Protect != PAGE_READONLY)
+                        {
+                           void **vtable = *(void ***)obj;
+                           MEMORY_BASIC_INFORMATION vbi;
+                           if (VirtualQuery(vtable, &vbi, sizeof(vbi)) &&
+                               vbi.State == MEM_COMMIT &&
+                               vbi.AllocationBase == (void *)GetModuleHandleA(0))
+                           {
+                              hx::Class cls = ((hx::Object *)obj)->__GetClass();
+                              if (cls.GetPtr())
+                                 name = cls->mName.raw_ptr();
+                           }
+                        }
+                        GCPerfLog("ROW-HEAL block=%d row=%d starts=%08x obj=%p hdr=%08x %s",
+                           mId, r, healStarts, obj, hdr, name);
+                        break;
+                     }
+                  }
+                  if (FULL)
+                     SWEEP_MARKED_ROW(r);
+                  r++;
+               }
+               else
+               {
+                  int start = r;
+                  ranges[hole].start = start;
 
                #ifdef HXCPP_ALIGN_ALLOC
                int alignR = (r+3) & ~3;
@@ -1412,8 +1689,11 @@ struct BlockDataInfo
                }
                ranges[hole].length = r-start;
                hole++;
+               }
             }
          }
+         #undef SWEEP_MARKED_ROW
+         #undef CHECK_FLAG
 
 
          int freeLines = 0;
@@ -1662,7 +1942,8 @@ struct BlockDataInfo
             {
                int pos = i<<2;
                if ( (starts & (1<<i)) &&
-                   (row[pos+HX_ENDIAN_MARK_ID_BYTE_HEADER]&FULL_MARK_BYTE_MASK) == gByteMarkID)
+                   ( (row[pos+HX_ENDIAN_MARK_ID_BYTE_HEADER]&FULL_MARK_BYTE_MASK) == gByteMarkID ||
+                     (row[pos+HX_ENDIAN_MARK_ID_BYTE_HEADER]&FULL_MARK_BYTE_MASK) == hx::gStampByteMarkID ) )
                   {
                      if ( (*(unsigned int *)(row+pos)) & IMMIX_ALLOC_IS_CONTAINER )
                      {
@@ -1687,7 +1968,8 @@ struct BlockDataInfo
             if (allocStart[i] & (1<<j))
             {
                unsigned int header = *(unsigned int *)( (char *)mPtr + i*IMMIX_LINE_LEN + j*4 );
-               if ((header & IMMIX_ALLOC_MARK_ID) == hx::gMarkID )
+               if ( (header & IMMIX_ALLOC_MARK_ID) == hx::gMarkID ||
+                    (header & IMMIX_ALLOC_MARK_ID) == hx::gStampMarkID )
                {
                   int rows = header & IMMIX_ALLOC_ROW_COUNT;
                   if (rows==0)
@@ -1786,7 +2068,9 @@ void GCCheckPointer(void *inPtr)
    #ifdef HXCPP_GC_NURSERY
    if (mark)
    #endif
-   if ( !(mark & HX_GC_CONST_ALLOC_MARK_BIT) && (mark&FULL_MARK_BYTE_MASK)!=gByteMarkID  )
+   if ( !(mark & HX_GC_CONST_ALLOC_MARK_BIT) &&
+        (mark&FULL_MARK_BYTE_MASK)!=gByteMarkID &&
+        (mark&FULL_MARK_BYTE_MASK)!=gStampByteMarkID  )
    {
       GCLOG("Old object access %p\n", inPtr);
       NullReference("Object", false);
@@ -1972,6 +2256,9 @@ struct GlobalChunks
 
    inline void release(MarkChunk *inChunk)
    {
+      // Defensive: a chunk re-entering the pool must not carry a count -
+      // alloc() hands chunks out without inspecting the previous contents.
+      inChunk->count = 0;
       while(true)
       {
          MarkChunk *head = (MarkChunk *)freeList;
@@ -2103,6 +2390,11 @@ struct GlobalChunks
             freeListPopLock = 0;
 
             head->next = 0;
+            // A pooled chunk must start EMPTY: pop() is LIFO, so a stale
+            // count makes the next owner hand out the previous life's
+            // entries as objects - non-heap pointers ended up on the mark
+            // stack and the walk stamped them (the static-string crash).
+            head->count = 0;
             return head;
          }
       }
@@ -2130,6 +2422,41 @@ struct GlobalChunks
 };
 
 GlobalChunks sGlobalChunks;
+
+// Row stamping for the marker's pop-site transition: an object that reaches
+// the plain current id must always carry marked rows.  Without this, an
+// object that reaches a mark chunk without a prior row stamp (a recycled
+// chunk entry, a weak-hash/side-table arrival) is popped and stamped with
+// the plain id, the sweep reads its row as a hole, and the per-allocation
+// reclaim hands its memory out while the header claims this-cycle liveness
+// (the RECLAIM-DISAGREE signature).  Factored from MarkAllocUnchecked's
+// MARK_ROWS block; large allocations have rows==0 and are skipped.
+static void MarkRowsForPlainId(void *inPtr)
+{
+   size_t ptr_i = ((size_t)inPtr) - sizeof(int);
+   unsigned int flags = *((unsigned int *)ptr_i);
+   int rows = flags & IMMIX_ALLOC_ROW_COUNT;
+   if (rows)
+   {
+      char *block = (char *)(ptr_i & IMMIX_BLOCK_BASE_MASK);
+      char *rowMark = block + ((ptr_i & IMMIX_BLOCK_OFFSET_MASK)>>IMMIX_LINE_BITS);
+      *rowMark = 1;
+      if (rows>1)
+      {
+         rowMark[1] = 1;
+         if (rows>2)
+         {
+            rowMark[2] = 1;
+            if (rows>3)
+            {
+               rowMark[3] = 1;
+               for(int r=4; r<rows; r++)
+                  rowMark[r]=1;
+            }
+         }
+      }
+   }
+}
 
 class MarkContext
 {
@@ -2170,7 +2497,16 @@ public:
     }
     ~MarkContext()
     {
-       if (marking) sGlobalChunks.free(marking);
+       if (marking)
+       {
+          // Same contract as releaseJobs: a chunk with pending work goes
+          // back to the job list, never to the free list with a count.
+          if (marking->count)
+             sGlobalChunks.pushJob(marking,false);
+          else
+             sGlobalChunks.free(marking);
+          marking = 0;
+       }
        #ifdef HXCPP_DEBUG
        delete [] mInfo;
        #endif
@@ -2305,12 +2641,19 @@ public:
              hx::Object *obj = marking->pop();
              if (obj)
              {
-                // Re-scanning a remembered referrer clears its remembered bit,
-                // otherwise the write barrier would ignore later black->white
-                // stores into it until the next cycle.
+                // Transition the object to the plain current id: it is being
+                // walked now, so later encounters skip it (the dedup skips
+                // only the plain id).  This also clears the hash-barrier's
+                // HX_GC_REMEMBERED flag, which is what lets the barrier
+                // re-queue the hash for later black->white stores.  Const
+                // allocations carry their const/nh bits in the same byte -
+                // never rewrite those.
                 unsigned char &objMark = ((unsigned char *)obj)[HX_ENDIAN_MARK_ID_BYTE];
-                if (objMark & HX_GC_REMEMBERED)
-                   objMark &= ~HX_GC_REMEMBERED;
+                if (!(objMark & HX_GC_CONST_ALLOC_MARK_BIT) && objMark != gByteMarkID)
+                {
+                   objMark = gByteMarkID;
+                   MarkRowsForPlainId(obj);
+                }
                 #ifdef HXCPP_GC_AUDIT
                 hx::Object *savedParent = mAuditParent;
                 mAuditParent = obj;
@@ -2395,12 +2738,14 @@ public:
                    GCTrace(traceBuf);
                 }
                 #endif
-                // Re-scanning a remembered referrer clears its remembered bit,
-                // otherwise the write barrier would ignore later black->white
-                // stores into it until the next cycle.
+                // Transition to the plain current id (see processMarkStack);
+                // const allocations keep their const/nh bits.
                 unsigned char &objMark = ((unsigned char *)obj)[HX_ENDIAN_MARK_ID_BYTE];
-                if (objMark & HX_GC_REMEMBERED)
-                   objMark &= ~HX_GC_REMEMBERED;
+                if (!(objMark & HX_GC_CONST_ALLOC_MARK_BIT) && objMark != gByteMarkID)
+                {
+                   objMark = gByteMarkID;
+                   MarkRowsForPlainId(obj);
+                }
                 #ifdef HXCPP_GC_AUDIT
                 hx::Object *savedParent = mAuditParent;
                 mAuditParent = obj;
@@ -2511,6 +2856,22 @@ void MarkAllocUnchecked(void *inPtr,hx::MarkContext *__inCtx)
    sAllocMarks++;
    #endif
 
+   #ifdef HXCPP_GC_AUDIT
+   // Raw allocations (hash elements, string data) are marked from a walking
+   // container - record that edge too, or the missed-path report prints "?"
+   // entries with no chain for exactly the allocations that get recycled
+   // and crash the next cycle's marker.
+   if (sAuditTrackParents && __inCtx->mAuditParent && sAuditParentMap)
+   {
+      std::lock_guard<std::mutex> lock(sAuditParentMapLock);
+      if (!sAuditParentMap->count(inPtr))
+      {
+         (*sAuditParentMap)[inPtr] = __inCtx->mAuditParent;
+         sAuditEdges++;
+      }
+   }
+   #endif
+
    size_t ptr_i = ((size_t)inPtr)-sizeof(int);
    unsigned int flags =  *((unsigned int *)ptr_i);
 
@@ -2559,7 +2920,7 @@ void MarkAllocUnchecked(void *inPtr,hx::MarkContext *__inCtx)
       else
       {
          // Large nursury object
-         ((unsigned char *)inPtr)[HX_ENDIAN_MARK_ID_BYTE] = gByteMarkID;
+         ((unsigned char *)inPtr)[HX_ENDIAN_MARK_ID_BYTE] = gStampByteMarkID;
       }
    }
    else
@@ -2572,7 +2933,13 @@ void MarkAllocUnchecked(void *inPtr,hx::MarkContext *__inCtx)
          DebuggerTrap();
       }
       #endif
-      ((unsigned char *)inPtr)[HX_ENDIAN_MARK_ID_BYTE] = gByteMarkID;
+      // Stamped, not plain: MarkAlloc is called both from the walk (pushing
+      // an allocation for scanning) and from the assign barriers (stamping a
+      // stored value without walking it).  The stamped id keeps the
+      // walk-dedup (which skips only the plain current id) descending
+      // barrier-stamped objects, so their unreached children get marked at
+      // the finish drain instead of being freed by the sweep.
+      ((unsigned char *)inPtr)[HX_ENDIAN_MARK_ID_BYTE] = gStampByteMarkID;
    }
 
    int rows = flags & IMMIX_ALLOC_ROW_COUNT;
@@ -2609,11 +2976,11 @@ void MarkAllocUnchecked(void *inPtr,hx::MarkContext *__inCtx)
 // object->field edge discovered by the marker records the child's first
 // parent.  The audit then walks this map upwards from each missed object,
 // printing the reference path that kept the object alive - the edge the
-// incremental barrier missed is somewhere on that path.  File scope: both
-// namespace-hx blocks (the allocator helpers and GlobalAllocator) use it.
-static bool sAuditTrackParents = false;
-static std::unordered_map<void *, void *> *sAuditParentMap = 0;
-static std::mutex sAuditParentMapLock;
+// incremental barrier missed is somewhere on that path.  The single copy of
+// sAuditTrackParents / sAuditParentMap / sAuditParentMapLock / sAuditEdges
+// lives at file scope in the GLOBAL namespace (top of this file) and is
+// deliberately NOT redeclared here: a namespace-local shadow made the
+// recorder fill a map the auditor never read (empty parent chains).
 #endif
 
 void MarkObjectAllocUnchecked(hx::Object *inPtr,hx::MarkContext *__inCtx)
@@ -2623,7 +2990,10 @@ void MarkObjectAllocUnchecked(hx::Object *inPtr,hx::MarkContext *__inCtx)
    {
       std::lock_guard<std::mutex> lock(sAuditParentMapLock);
       if (!sAuditParentMap->count(inPtr))
+      {
          (*sAuditParentMap)[inPtr] = __inCtx->mAuditParent;
+         sAuditEdges++;
+      }
    }
    #endif
 
@@ -3022,7 +3392,9 @@ void FindZombies(MarkContext &inContext)
       ++next;
 
       unsigned char mark = ((unsigned char *)obj)[HX_ENDIAN_MARK_ID_BYTE];
-      if ( mark!=gByteMarkID )
+      // The low nibble is shared by the plain id and its stamped twin, so
+      // stamped-but-unwalked objects count as alive here.
+      if ( (mark & 0x0f) != (gByteMarkID & 0x0f) )
       {
          sZombieList.push(obj);
          sMakeZombieSet.erase(i);
@@ -3047,7 +3419,9 @@ bool IsWeakRefValid(const HX_CHAR *inPtr)
    unsigned char mark = ((unsigned char *)inPtr)[HX_ENDIAN_MARK_ID_BYTE];
 
     // Special case of member closure - check if the 'this' pointer is still alive
-   return  mark==gByteMarkID;
+   // The low nibble covers the plain id and its stamped twin (born/barrier
+   // stamps) - both mean this-cycle-live.
+   return (mark & 0x0f) == (gByteMarkID & 0x0f);
 }
 
 bool IsWeakRefValid(hx::Object *inPtr)
@@ -3055,14 +3429,14 @@ bool IsWeakRefValid(hx::Object *inPtr)
    unsigned char mark = ((unsigned char *)inPtr)[HX_ENDIAN_MARK_ID_BYTE];
 
     // Special case of member closure - check if the 'this' pointer is still alive
-    bool isCurrent = mark==gByteMarkID;
+    bool isCurrent = (mark & 0x0f) == (gByteMarkID & 0x0f);
     if ( !isCurrent && inPtr->__GetType()==vtFunction)
     {
         hx::Object *thiz = (hx::Object *)inPtr->__GetHandle();
         if (thiz)
         {
             mark = ((unsigned char *)thiz)[HX_ENDIAN_MARK_ID_BYTE];
-            if (mark==gByteMarkID)
+            if ((mark & 0x0f) == (gByteMarkID & 0x0f))
             {
                // The object is still alive, so mark the closure and continue
                MarkAlloc(inPtr,0);
@@ -3131,6 +3505,45 @@ static int localAllocs;
 static int rootObjects;
 static int rootAllocs;
 
+// Finalizer-safety classification: a registration whose object was already
+// reclaimed (allocStart cleared) or whose memory was zeroed while the
+// allocator still accounts it live must NOT be fired - firing runs code
+// through a freed/zeroed vtable (the RunFinalizers crash on freed+zeroed
+// memory).  Returns 0 = fire, 1 = freed (skip), 2 = zeroed (skip for
+// objects only - raw allocations have no vtable).
+static bool GcPtrProbeReadable(void *inPtr);
+static int sFinalizerSkipLogged = 0;
+static int FinalizerObjectState(void *inObj)
+{
+   if (!GcPtrProbeReadable(inObj))
+      return 1;
+   if (((unsigned char *)inObj)[HX_GC_CONST_ALLOC_MARK_OFFSET] & HX_GC_CONST_ALLOC_MARK_BIT)
+      return 0;
+   size_t hdr_i = ((size_t)inObj) - sizeof(unsigned int);
+   if (!gBlockInfo || !GcPtrProbeReadable((void *)(hdr_i & IMMIX_BLOCK_BASE_MASK)))
+      return 0; // large/blob allocation - not tracked per-block, treat as alive
+   unsigned int blockId = *(unsigned int *)(hdr_i & IMMIX_BLOCK_BASE_MASK);
+   if (blockId >= gBlockInfo->size())
+      return 0;
+   BlockDataInfo *info = (*gBlockInfo)[blockId];
+   if (!info || (BlockData *)info->mPtr != (BlockData *)(hdr_i & IMMIX_BLOCK_BASE_MASK))
+      return 1; // id reused after destroy - stale pointer
+   int row = (int)((hdr_i & IMMIX_BLOCK_OFFSET_MASK)>>IMMIX_LINE_BITS);
+   if (row < IMMIX_HEADER_LINES || row >= IMMIX_LINES)
+      return 1;
+   if (!(info->allocStart[row] & gImmixStartFlag[hdr_i & 127]))
+      return 1; // allocation was freed by a sweep
+   return 2; // accounted live - the caller checks the vtable for objects
+}
+
+static void FinalizerSkipLog(void *inObj, int inState, const char *inList)
+{
+   if (sFinalizerSkipLogged >= 40)
+      return;
+   sFinalizerSkipLogged++;
+   GCPerfLog("FIN-SKIP %s obj=%p state=%s", inList, inObj, inState==1 ? "freed" : "zeroed");
+}
+
 void RunFinalizers()
 {
    finalizerCount = 0;
@@ -3145,9 +3558,16 @@ void RunFinalizers()
          list.qerase(idx);
          delete f;
       }
-      else if (((unsigned char *)(f->mObject))[HX_ENDIAN_MARK_ID_BYTE] != gByteMarkID)
+      else if ( (((unsigned char *)(f->mObject))[HX_ENDIAN_MARK_ID_BYTE] & 0x0f) != (gByteMarkID & 0x0f) )
       {
-         if (f->mFinalizer)
+         // The low nibble is shared by the plain id and its stamped twin, so
+         // stamped-but-unwalked (born/barrier-stamped) objects stay alive here.
+         int fstate = FinalizerObjectState(f->mObject);
+         if (fstate)
+         {
+            FinalizerSkipLog(f->mObject, fstate, "internal");
+         }
+         else if (f->mFinalizer)
          {
             f->mFinalizer(f->mObject);
             finalizerCount++;
@@ -3166,10 +3586,20 @@ void RunFinalizers()
    {
       Finalizable &f = sFinalizableList[idx];
       unsigned char mark = ((unsigned char *)f.base)[HX_ENDIAN_MARK_ID_BYTE];
-      if ( mark!=gByteMarkID )
+      if ( (mark & 0x0f) != (gByteMarkID & 0x0f) )
       {
-         finalizerCount++;
-         f.run();
+         int fstate = FinalizerObjectState(f.base);
+         // Raw-alloc finalizers (isMember==false) run on non-object memory:
+         // a zero vtable is normal there, so only the freed state skips.
+         if (fstate==1 || (fstate==2 && f.isMember))
+         {
+            FinalizerSkipLog(f.base, fstate, f.isMember ? "member" : "alloc");
+         }
+         else
+         {
+            finalizerCount++;
+            f.run();
+         }
          sFinalizableList.qerase(idx);
       }
       else
@@ -3183,10 +3613,16 @@ void RunFinalizers()
       ++next;
 
       unsigned char mark = ((unsigned char *)obj)[HX_ENDIAN_MARK_ID_BYTE];
-      if ( mark!=gByteMarkID )
+      if ( (mark & 0x0f) != (gByteMarkID & 0x0f) )
       {
-         finalizerCount++;
-         (*i->second)(obj);
+         int fstate = FinalizerObjectState(obj);
+         if (fstate)
+            FinalizerSkipLog(obj, fstate, "cset");
+         else
+         {
+            finalizerCount++;
+            (*i->second)(obj);
+         }
          sFinalizerMap.erase(i);
       }
 
@@ -3201,10 +3637,16 @@ void RunFinalizers()
       ++next;
 
       unsigned char mark = ((unsigned char *)obj)[HX_ENDIAN_MARK_ID_BYTE];
-      if ( mark!=gByteMarkID )
+      if ( (mark & 0x0f) != (gByteMarkID & 0x0f) )
       {
-         finalizerCount++;
-         (*i->second)(obj);
+         int fstate = FinalizerObjectState(obj);
+         if (fstate)
+            FinalizerSkipLog(obj, fstate, "haxe");
+         else
+         {
+            finalizerCount++;
+            (*i->second)(obj);
+         }
          sHaxeFinalizerMap.erase(i);
       }
 
@@ -3459,6 +3901,61 @@ public:
 
 
 class GlobalAllocator *sGlobalAlloc = 0;
+
+// Hash-walk validation + env-flag cache (see the declarations in GC.h).
+// These live in namespace hx to match the GC.h declarations.
+static bool sWalkValidate = false;
+static bool sWalkValidateInit = false;
+namespace hx
+{
+bool GcWalkValidationEnabled(void)
+{
+   if (!sWalkValidateInit)
+   {
+      const char *v = getenv("HXCPP_VALIDATE_HASH_WALK");
+      sWalkValidate = v && v[0]=='1';
+      sWalkValidateInit = true;
+   }
+   return sWalkValidate;
+}
+
+bool GcEnvFlagCached(const char *inName)
+{
+   // Small fixed set of cached bisect flags; unknown names fall back to
+   // getenv each call (they are not hot paths).
+   static int sNoDeferredFree = -1;
+   static int sAssignBarrierOff = -1;
+   if (!strcmp(inName,"HXCPP_NO_DEFERRED_FREE"))
+   {
+      if (sNoDeferredFree<0)
+      {
+         const char *v = getenv(inName);
+         sNoDeferredFree = v && v[0]=='1';
+      }
+      return sNoDeferredFree!=0;
+   }
+   if (!strcmp(inName,"HXCPP_ASSIGN_BARRIER_OFF"))
+   {
+      if (sAssignBarrierOff<0)
+      {
+         const char *v = getenv(inName);
+         sAssignBarrierOff = v && v[0]=='1';
+      }
+      return sAssignBarrierOff!=0;
+   }
+   const char *v = getenv(inName);
+   return v && v[0]=='1';
+}
+
+void GcBadLinkLog(void *inElem, void *inHash)
+{
+   // NOTE: inElem is a WILD pointer by definition (the range check failed) -
+   // never dereference it here, or the logger itself crashes on the poison.
+#ifdef HXCPP_GC_AUDIT
+   GCAuditLog("badlink elem=%p hash=%p", inElem, inHash);
+#endif
+}
+} // namespace hx
 
 
 inline bool SortByBlockPtr(BlockDataInfo *inA, BlockDataInfo *inB)
@@ -3720,26 +4217,19 @@ public:
 #endif
 
       ((unsigned char *)inLarge)[HX_ENDIAN_MARK_ID_BYTE] = 0;
-      // AllocLarge will not lock this list unless it decides there is a suitable
-      //  value, so we can't doa realloc without potentially crashing it.
-      if (largeObjectRecycle.hasExtraCapacity(1))
-      {
-         unsigned int *blob = ((unsigned int *)inLarge) - 2;
-         unsigned int size = *blob;
-         mLargeListLock.lock();
-         mLargeAllocated -= size;
-         // Could somehow keep it in the list, but mark as recycled?
-         mLargeList.qerase_val(blob);
-         // We could maybe free anyhow?
-         if (!largeObjectRecycle.hasExtraCapacity(1))
-         {
-            mLargeListLock.unlock();
-            HxFree(blob);
-            return;
-         }
-         largeObjectRecycle.push(blob);
-         mLargeListLock.unlock();
-      }
+      unsigned int *blob = ((unsigned int *)inLarge) - 2;
+      // One cycle of grace instead of an immediate release/recycle: the
+      // finalizer that destroyed this object may have raced a reference the
+      // marker still follows (timer callbacks running on their own thread).
+      // The next sweep's grace resolve re-checks the byte - a re-stamped
+      // blob is restored to mLargeList (LARGE-GRACE-SAVED) and a still-dead
+      // one is released.  No immediate HxFree, no recycle reuse: a live
+      // object's memory cannot be handed out from under it, and the
+      // accounting stays untouched until the resolve.
+      mLargeListLock.lock();
+      mLargeList.qerase_val(blob);
+      largeGraceList.push(blob);
+      mLargeListLock.unlock();
    }
 
    void *AllocLarge(int inSize, bool inClear)
@@ -3827,7 +4317,8 @@ public:
       #ifdef HXCPP_GC_NURSERY
       result[1] = 0;
       #else
-      result[1] = hx::gMarkID;
+      // Born-stamped (see the comment in GC.h and CallAlloc).
+      result[1] = hx::gStampMarkID;
       #endif
 
       if (do_lock && !isLocked)
@@ -4066,6 +4557,19 @@ public:
       gAllocGroups[gid].blocks = n;
       gAllocGroups[gid].clear();
 
+      // Extend the managed block region for the mark-entry range filter:
+      // pointers inside [low,high) go straight to the stamp path, pointers
+      // outside get the exact validation (large objects pass, .rdata/C++
+      // pointers are rejected before they can be stamped).
+      {
+         unsigned char *lo = (unsigned char *)aligned;
+         unsigned char *hi = lo + n * IMMIX_BLOCK_SIZE;
+         if (!hx::gBlockRegionLow || lo < hx::gBlockRegionLow)
+            hx::gBlockRegionLow = lo;
+         if (!hx::gBlockRegionHigh || hi > hx::gBlockRegionHigh)
+            hx::gBlockRegionHigh = hi;
+      }
+
       int newSize = mFreeBlocks.size();
       {
          // The lazy sweep publishes blocks into the same list from other
@@ -4279,7 +4783,10 @@ public:
                GCPerfLog("incr-frag-finish size=%d blocks=%d free=%d wm=%d target=%d",
                   inRequiredBytes, (int)mAllBlocks.size(), (int)mFreeBlocks.size(),
                   (int)GetWorkingMemory(), (int)sWorkingMemorySize);
+               // FinishIncremental now completes the row sweep inside its
+                // pause, so the reclaimed rows are available right here.
                FinishIncremental();
+               result = GetNextFree(inRequiredBytes);
                while (!result && SweepOneBlock())
                   result = GetNextFree(inRequiredBytes);
             }
@@ -4428,7 +4935,8 @@ public:
                      unsigned int *row = (unsigned int *)from->mPtr->mRow[r];
                      unsigned int &header = row[i];
 
-                     if ((header&IMMIX_ALLOC_MARK_ID) == hx::gMarkID)
+                     if ( (header&IMMIX_ALLOC_MARK_ID) == hx::gMarkID ||
+                          (header&IMMIX_ALLOC_MARK_ID) == hx::gStampMarkID)
                      {
                         int size = ((header & IMMIX_ALLOC_SIZE_MASK) >> IMMIX_ALLOC_SIZE_SHIFT);
                         int allocSize = size + sizeof(int);
@@ -4638,7 +5146,8 @@ public:
                         unsigned int *row = (unsigned int *)from->mPtr->mRow[r];
                         unsigned int &header = row[loc];
 
-                        if ((header&IMMIX_ALLOC_MARK_ID) == hx::gMarkID)
+                        if ( (header&IMMIX_ALLOC_MARK_ID) == hx::gMarkID ||
+                             (header&IMMIX_ALLOC_MARK_ID) == hx::gStampMarkID)
                         {
                            int size = ((header & IMMIX_ALLOC_SIZE_MASK) >> IMMIX_ALLOC_SIZE_SHIFT);
                            int allocSize = size + sizeof(int);
@@ -4763,7 +5272,7 @@ public:
       for(int i=0;i<mAllBlocks.size();i++)
       {
          BlockDataInfo *info = mAllBlocks[i];
-         if (!info->isEmpty() || info->mOwned)
+         if (info->mayHoldLiveData())
             gAllocGroups[info->mGroupId].isEmpty = false;
       }
 
@@ -4777,7 +5286,13 @@ public:
             // Async OS release: VirtualFree of hundreds of MB measured tens of
             // ms inside this pause (gc_perf.log "stats" time).  Nothing below
             // references the group memory any more.
-            QueueBlockGroupFree(g.alloc);
+            // BISECT (HXCPP_NO_SHRINK_RELEASE): keep the group memory reserved
+            // but still run the full bookkeeping (block list rebuild, free
+            // list filter, info destroy).  If the crash disappears with the
+            // release disabled, the OS-release path is the culprit; if it
+            // persists, the bookkeeping (which block got judged empty) is.
+            if (!gcBisectFlag("HXCPP_NO_SHRINK_RELEASE"))
+               QueueBlockGroupFree(g.alloc);
             g.alloc = 0;
             released += bytes;
          }
@@ -4785,6 +5300,26 @@ public:
 
       if (!released)
          return 0;
+
+      // Shrink the managed block region to the surviving groups so the
+      // mark-entry range filter stops trusting the freed VA range.
+      {
+         unsigned char *lo = 0;
+         unsigned char *hi = 0;
+         for(int i=0;i<gAllocGroups.size();i++)
+         {
+            if (!gAllocGroups[i].alloc)
+               continue;
+            unsigned char *g = (unsigned char *)gAllocGroups[i].alloc;
+            unsigned char *ge = g + gAllocGroups[i].blocks * IMMIX_BLOCK_SIZE;
+            if (!lo || g < lo)
+               lo = g;
+            if (!hi || ge > hi)
+               hi = ge;
+         }
+         hx::gBlockRegionLow = lo;
+         hx::gBlockRegionHigh = hi;
+      }
 
 
       // The compaction pass below deletes the BlockDataInfo of every
@@ -4847,10 +5382,9 @@ public:
       int groups=0;
       for(int i=0; i<mAllBlocks.size(); i++ )
       {
-         // Owned blocks hold live mutator data even when the row counters
-         // are stale - never mark their group empty (same hole as
-         // ShrinkBlocks, same defensive guard).
-         if (!mAllBlocks[i]->isEmpty() || mAllBlocks[i]->mOwned)
+         // Same hole as ShrinkBlocks: mUsedRows is stale for blocks the
+         // allocator owned across a sweep - use the authoritative check.
+         if (mAllBlocks[i]->mayHoldLiveData())
              gAllocGroups[mAllBlocks[i]->mGroupId].isEmpty=false;
       }
 
@@ -5513,6 +6047,10 @@ public:
          hx::gMarkID = gByteMarkID << 24;
          hx::gMarkIDWithContainer = (gByteMarkID << 24) | IMMIX_ALLOC_IS_CONTAINER;
          gRememberedByteMarkID = gByteMarkID | HX_GC_REMEMBERED;
+         // Stamped-this-cycle id (see BeginIncremental): born allocations and
+         // barrier stamps carry the 0x30-prefixed twin of the current id.
+         hx::gStampByteMarkID = 0x30 | (hx::gByteMarkID & 0x0f);
+         hx::gStampMarkID = hx::gStampByteMarkID << 24;
 
          #ifdef HX_WATCH
          GCLOG(" non-gen mark byte -> %02x\n", hx::gByteMarkID);
@@ -5639,7 +6177,13 @@ public:
       }
       while(markedWeakValue);
 
+      // Weakfin-spike detector: the scene-switch unload spikes this phase
+      // (1.9-4.5ms vs the 0.01ms norm) right before the crash family.  Dump
+      // the pre-crash state for forensics.
+      double tWeakSpike = __hxcpp_time_stamp();
       hx::RunFinalizers();
+      if (__hxcpp_time_stamp() - tWeakSpike > 0.002)
+         GcWriteDiagnosticDump("weakfin");
       double tM4 = __hxcpp_time_stamp();
       {
          int orphaned = hx::sGlobalChunks.pendingJobs();
@@ -5879,17 +6423,25 @@ public:
                   hx::sGlobalChunks.free(ctx->mOldReferrers);
                ctx->mOldReferrers = 0;
             }
+            // Hand the context a fresh chunk immediately: CallAlloc queues
+            // born containers through it, and a null chunk here would
+            // silently drop every allocation until the next begin (the
+            // born-container window after each full collect).
+            ctx->mOldReferrers = hx::sGlobalChunks.alloc();
          }
          for(int i=0;i<LOCAL_POOL_SIZE;i++)
          {
             hx::StackContext *ctx = (hx::StackContext *)mLocalPool[i];
-            if (ctx && ctx->mOldReferrers)
+            if (ctx)
             {
-               if (ctx->mOldReferrers->count)
-                  hx::sGlobalChunks.addLocked(ctx->mOldReferrers);
-               else
-                  hx::sGlobalChunks.free(ctx->mOldReferrers);
-               ctx->mOldReferrers = 0;
+               if (ctx->mOldReferrers)
+               {
+                  if (ctx->mOldReferrers->count)
+                     hx::sGlobalChunks.addLocked(ctx->mOldReferrers);
+                  else
+                     hx::sGlobalChunks.free(ctx->mOldReferrers);
+               }
+               ctx->mOldReferrers = hx::sGlobalChunks.alloc();
             }
          }
       }
@@ -6090,6 +6642,34 @@ public:
          recycleRemaining = mLargeAllocForceRefresh;
       #endif
 
+      // LARGE GRACE PERIOD: resolve blobs held from the previous sweep.  A
+      // blob whose mark byte came back current was wrongly judged dead last
+      // cycle - restore it (LARGE-GRACE-SAVED is direct evidence of the
+      // wrong free) - a blob still dead is released.  Grace blobs were never
+      // freed nor recycled, so a wrongly-judged live object's memory cannot
+      // have been reused under it.
+      for(int i=0;i<largeGraceList.size();i++)
+      {
+         unsigned int *blob = largeGraceList[i];
+         unsigned int id = blob[1] & IMMIX_ALLOC_MARK_ID;
+         if (id==hx::gMarkID || id==hx::gStampMarkID)
+         {
+            mLargeList.push(blob);
+            if (sLargeGraceSavedLogged < 40)
+            {
+               sLargeGraceSavedLogged++;
+               GCPerfLog("LARGE-GRACE-SAVED blob=%p obj=%p size=%d byte=%02x",
+                  (void *)blob, (void *)(blob+2), (int)blob[0], id>>24);
+            }
+         }
+         else
+         {
+            mLargeAllocated -= blob[0];
+            QueueLargeFree(blob);
+         }
+      }
+      largeGraceList.setSize(0);
+
       int l0 = mLargeList.size();
       // Compact the live entries in place.  qerase() shifts the whole tail on
       // every removal, which made this sweep O(n^2) with thousands of large
@@ -6098,19 +6678,19 @@ public:
       for(int i=0;i<l0;i++)
       {
          unsigned int *blob = mLargeList[i];
-         if ( (blob[1] & IMMIX_ALLOC_MARK_ID) != hx::gMarkID )
+         if ( (blob[1] & IMMIX_ALLOC_MARK_ID) != hx::gMarkID &&
+              (blob[1] & IMMIX_ALLOC_MARK_ID) != hx::gStampMarkID )
          {
-            unsigned int size = *blob;
-            mLargeAllocated -= size;
-            if (size < recycleRemaining)
-            {
-               recycleRemaining -= size;
-               largeObjectRecycle.push(blob);
-            }
-            else
-            {
-               QueueLargeFree(blob);
-            }
+            // One cycle of grace instead of an immediate release (see the
+            // grace resolve above).  The recycleRemaining path is bypassed:
+            // recycled memory is reusable immediately, which is exactly what
+            // must not happen for a possibly-wrong sweep verdict.
+            if (sLargeGraceSavedLogged < 80)
+               GCPerfLog("LARGE-GRACE-KEEP blob=%p size=%d byte=%02x cur=%02x stamp=%02x",
+                  (void *)blob, (int)blob[0],
+                  (blob[1] & IMMIX_ALLOC_MARK_ID) >> 24,
+                  hx::gMarkID >> 24, hx::gStampMarkID >> 24);
+            largeGraceList.push(blob);
          }
          else
             mLargeList[live++] = blob;
@@ -6447,15 +7027,49 @@ public:
       #endif
    }
 
+   // A recycled allocation can still look mapped and point at mapped memory,
+   // so "mapped" is not enough to trust a vtable: the crash at
+   // FinishIncremental+0x669 came from __GetClass() on a "missed object"
+   // whose first pointer was a heap address, not a vtable.  Only accept
+   // pointers that land inside the executable's image, where all real
+   // vtables live.
+   static bool AuditLooksLikeVtable(void *inPtr)
+   {
+      #ifdef HX_WINDOWS
+      static char *exeBase = 0;
+      static size_t exeSize = 0;
+      if (!exeBase)
+      {
+         HMODULE mod = 0;
+         if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT |
+                                 GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+                                 (LPCSTR)&AuditLooksLikeVtable, &mod))
+            return false;
+         IMAGE_DOS_HEADER *dos = (IMAGE_DOS_HEADER *)mod;
+         if (dos->e_magic != IMAGE_DOS_SIGNATURE)
+            return false;
+         IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)((char *)mod + dos->e_lfanew);
+         if (nt->Signature != IMAGE_NT_SIGNATURE)
+            return false;
+         exeBase = (char *)mod;
+         exeSize = nt->OptionalHeader.SizeOfImage;
+      }
+      if (!exeBase || (char *)inPtr < exeBase || (char *)inPtr >= exeBase + exeSize)
+         return false;
+      #endif
+      return AuditLooksMapped(inPtr);
+   }
+
    // Reads the class name of an object with the same safety rules the audit's
-   // missed-object printer uses (vtable + class pointer must look mapped).
+   // missed-object printer uses (vtable must be in the exe image, class
+   // pointer must look mapped).
    static const char *AuditClassName(hx::Object *obj)
    {
       const char *name = "?";
       if (!obj || !AuditLooksMapped(obj))
          return name;
       void **vtable = *(void ***)obj;
-      if (!AuditLooksMapped(vtable))
+      if (!AuditLooksLikeVtable(vtable))
          return name;
       hx::Class cls = obj->__GetClass();
       if (cls.GetPtr() && AuditLooksMapped(cls.GetPtr()))
@@ -6490,8 +7104,11 @@ public:
                // Remembered objects carry HX_GC_REMEMBERED on top of the cycle
                // byte; they are just as marked as plain black objects.
                unsigned char mark = ((unsigned char *)obj)[HX_ENDIAN_MARK_ID_BYTE];
-               if ((mark & FULL_MARK_BYTE_MASK) == (hx::gByteMarkID & FULL_MARK_BYTE_MASK))
+               if ( (mark & FULL_MARK_BYTE_MASK) == (hx::gByteMarkID & FULL_MARK_BYTE_MASK) ||
+                    (mark & FULL_MARK_BYTE_MASK) == (hx::gStampByteMarkID & FULL_MARK_BYTE_MASK) )
                   out.insert(obj);
+               else if (sBeforeBytes)
+                  (*sBeforeBytes)[obj] = mark;
             }
          }
       }
@@ -6500,6 +7117,43 @@ public:
          unsigned int *blob = mLargeList[i];
          if ((blob[1] & IMMIX_ALLOC_MARK_ID) == hx::gMarkID)
             out.insert((hx::Object *)(blob+2));
+      }
+   }
+
+   // Clear every allocation's mark byte so the audit's full mark re-walks the
+   // whole graph from scratch.  Without this the heap is already black, the
+   // full mark skips every object, no child->parent edges are recorded and
+   // the missed-path report has nothing to print.  The sweep afterwards sees
+   // a freshly marked heap and behaves exactly as a normal cycle would.
+   void AuditClearMarks()
+   {
+      for(int i=0;i<mAllBlocks.size();i++)
+      {
+         BlockDataInfo *block = mAllBlocks[i];
+         char *base = (char *)block->mPtr;
+         unsigned char *rowMarks = (unsigned char *)block->mPtr;
+         for(int r=IMMIX_HEADER_LINES; r<IMMIX_LINES; r++)
+         {
+            if (!rowMarks[r])
+               continue;
+            unsigned int flags = block->allocStart[r];
+            if (!flags)
+               continue;
+            for(int bit=0; bit<32; bit++)
+            {
+               if (!(flags & (1u<<bit)))
+                  continue;
+               unsigned int *header = (unsigned int *)(base + (r<<IMMIX_LINE_BITS) + (bit*4));
+               if ((*header & IMMIX_ALLOC_ROW_COUNT)==0)
+                  continue;
+               ((unsigned char *)header)[HX_ENDIAN_MARK_ID_BYTE] = 0;
+            }
+         }
+      }
+      for(int i=0;i<mLargeList.size();i++)
+      {
+         unsigned int *blob = mLargeList[i];
+         blob[1] &= ~IMMIX_ALLOC_MARK_ID;
       }
    }
    #endif
@@ -6658,6 +7312,10 @@ public:
       hx::gMarkID = hx::gByteMarkID << 24;
       hx::gMarkIDWithContainer = (hx::gByteMarkID << 24) | IMMIX_ALLOC_IS_CONTAINER;
       hx::gRememberedByteMarkID = hx::gByteMarkID | HX_GC_REMEMBERED;
+      // Stamped-this-cycle id: shares the current cycle's low nibble so the
+      // sweep and the finalizer checks recognize it as this-cycle-live.
+      hx::gStampByteMarkID = 0x30 | (hx::gByteMarkID & 0x0f);
+      hx::gStampMarkID = hx::gStampByteMarkID << 24;
       gBlockStack = 0;
       // Parallel over the worker pool (pool is idle here: StopThreadJobs ran
       // above) - the single-threaded pass cost 0.3-0.6ms of every begin pause.
@@ -6700,12 +7358,14 @@ public:
       hx::gIncrementalMarking = true;
       sgIsCollecting = false;
 
-      // The roots marked above sit in mMarker's local chunk; publish it so the
-      // background workers can drain everything, then hand tpjMark to the
-      // pool.  Threads wake with the world still paused and are already
-      // draining when the mutators resume.
+      // The roots marked above sit in mMarker's local chunk; publish it to
+      // the global job list.  The mark graph is drained by budgeted STW
+      // steps (StepIncremental) driven from the frame tick - NO concurrent
+      // marking: the generated code carries no write barriers, so the
+      // mutator must never run while the marker walks.  The assignment
+      // barrier (ObjectPtr/String operator=) covers the stores between
+      // steps.
       mMarker.releaseJobs();
-      StartBackgroundMark();
 
       hx::gPauseForCollect = 0x00000000;
       #ifndef HXCPP_SINGLE_THREADED_APP
@@ -6735,6 +7395,8 @@ public:
    {
       if (!sgIncrementalActive)
          return;
+      if (hx::gPauseForCollect)
+         return; // another collect owns the pause
 
       double tStep = __hxcpp_time_stamp();
 
@@ -6743,6 +7405,24 @@ public:
       static int sStepLog = 0;
       if ((sStepLog++ & 15)==0)
          GCAuditLog("step %d frame=%d", sStepLog, sGcFrameCount);
+      #endif
+
+      volatile int stackBottom = 1;
+      LocalAllocator *this_local = (LocalAllocator *)(hx::ImmixAllocator *)hx::tlsStackContext;
+
+      // STW for the duration of this step: the mutators park at their next
+      // safepoint, the main thread drains the mark stack for the frame
+      // budget, the world resumes.  No concurrent marking - the generated
+      // code carries no write barriers, so the mutator must never run while
+      // the marker walks.  The assign barrier covers the stores between
+      // steps.
+      #ifndef HXCPP_SINGLE_THREADED_APP
+      if (_hx_atomic_compare_exchange((volatile int *)&hx::gPauseForCollect, 0, 0xffffffff) != 0)
+         return;
+      gThreadStateChangeLock->lock();
+      for(int i=0;i<mLocalAllocs.size();i++)
+         if (mLocalAllocs[i]!=this_local)
+            WaitForSafe(mLocalAllocs[i]);
       #endif
 
       // Object counts do not translate to time (arrays are marked in bulk),
@@ -6764,6 +7444,14 @@ public:
 
       sIncrStepTotal += __hxcpp_time_stamp() - tStep;
       sIncrStepFrames++;
+
+      #ifndef HXCPP_SINGLE_THREADED_APP
+      hx::gPauseForCollect = 0x00000000;
+      for(int i=0;i<mLocalAllocs.size();i++)
+         if (mLocalAllocs[i]!=this_local)
+            ReleaseFromSafe(mLocalAllocs[i]);
+      gThreadStateChangeLock->unlock();
+      #endif
 
       if (done)
          FinishIncremental();
@@ -6817,6 +7505,11 @@ public:
       mMarker.isGenerational = false;
 
       // Must still drain the barrier chunks, otherwise they overflow.
+      // Re-allocate (instead of leaving null) so the assign-barrier keeps
+      // recording through the rest of the finish (RunFinalizers runs Haxe
+      // code while gIncrementalMarking is still true) and through the lazy
+      // sweep - a null chunk makes pushReferrer silently drop, which is the
+      // missed-mark bug this drain exists to prevent.
       for(int i=0;i<mLocalAllocs.size();i++)
       {
          hx::StackContext *ctx = (hx::StackContext *)mLocalAllocs[i];
@@ -6826,7 +7519,7 @@ public:
                hx::sGlobalChunks.addLocked(ctx->mOldReferrers);
             else
                hx::sGlobalChunks.free(ctx->mOldReferrers);
-            ctx->mOldReferrers = 0;
+            ctx->mOldReferrers = hx::sGlobalChunks.alloc();
          }
       }
 
@@ -6875,6 +7568,13 @@ public:
       {
          sAuditCycles++;
          std::unordered_set<void*> before;
+         {
+            std::lock_guard<std::mutex> lock(sAuditParentMapLock);
+            if (!sBeforeBytes)
+               sBeforeBytes = new std::unordered_map<void *, unsigned char>();
+            else
+               sBeforeBytes->clear();
+         }
          AuditCollectMarked(before);
          // Track child->parent edges while the full mark runs, so missed
          // objects can print the reference path that kept them alive.
@@ -6885,7 +7585,12 @@ public:
             else
                sAuditParentMap->clear();
          }
+         // The heap is black from the incremental mark - a full mark would
+         // skip every object and record no edges.  Clear the marks so the
+         // audit pass walks the whole live graph and fills the parent map.
+         AuditClearMarks();
          sAuditTrackParents = true;
+         sAuditEdges = 0;
          MarkAll(false);
          sAuditTrackParents = false;
          std::unordered_set<void*> after;
@@ -6895,29 +7600,97 @@ public:
          if (audit)
          {
             int missing = 0;
+            int artifacts = 0;
+            int artifactsPrinted = 0;
+            int realMisses = 0;
             for(std::unordered_set<void*>::iterator it = after.begin(); it!=after.end(); ++it)
             {
                if (before.count(*it))
                   continue;
-               if (++missing > 40)
+               missing++;
+               // prebyte==0 entries are leftovers of the previous audit pass
+               // (mark bits cleared, lazy sweep has not reclaimed the block
+               // yet) that the conservative stack scan resurrected - noise.
+               // prebyte!=0 objects carried a real mark id from a previous
+               // cycle and were still missed - a true incremental miss.
+               unsigned char preByte = 0;
+               if (sBeforeBytes)
+               {
+                  auto bit = sBeforeBytes->find(*it);
+                  if (bit != sBeforeBytes->end())
+                     preByte = bit->second;
+               }
+               if (preByte == 0)
+               {
+                  artifacts++;
+                  // The artifact counts under real gameplay reach 100-300K
+                  // per cycle (every other cycle) - these were dismissed as
+                  // conservative-scan noise, but that classification is
+                  // unproven and the volume says something systematic is
+                  // happening.  Sample them with the same parent-chain walk
+                  // the real misses get, so the log shows WHERE the full
+                  // mark reached them from and whether the incremental walk
+                  // could have reached it too.
+                  if (++artifactsPrinted > 25)
+                     continue;
+                  const char *name = "?";
+                  hx::Object *obj = (hx::Object *)(*it);
+                  if (AuditLooksMapped(obj))
+                  {
+                     void **vtable = *(void ***)obj;
+                     if (AuditLooksLikeVtable(vtable))
+                     {
+                        hx::Class cls = obj->__GetClass();
+                        if (cls.GetPtr() && AuditLooksMapped(cls.GetPtr()))
+                           name = cls->mName.raw_ptr();
+                     }
+                  }
+                  fprintf(audit, "artifact %p %s\n", *it, name);
+                  void *cur = *it;
+                  for(int hop=0; hop<8 && cur; hop++)
+                  {
+                     void *parent = 0;
+                     {
+                        std::lock_guard<std::mutex> lock(sAuditParentMapLock);
+                        auto pit = sAuditParentMap->find(cur);
+                        if (pit != sAuditParentMap->end())
+                           parent = pit->second;
+                     }
+                     if (!parent)
+                     {
+                        fprintf(audit, "   via (root/stack/header)\n");
+                        break;
+                     }
+                     fprintf(audit, "   via %c %p %s\n",
+                        before.count(parent) ? 'B' : '-',
+                        parent, AuditClassName((hx::Object *)parent));
+                     cur = parent;
+                  }
+                  continue;
+               }
+               if (++realMisses > 40)
                   break;
                const char *name = "?";
                hx::Object *obj = (hx::Object *)(*it);
-               // Only dereference the class pointer if the memory is committed;
-               // stale allocStart entries can otherwise point at garbage.
+               // Only dereference the class pointer if the memory is committed
+               // and the first pointer is a real vtable in the exe image;
+               // stale allocStart entries can otherwise point at garbage
+               // (a recycled allocation reached via a conservative stack slot).
                if (AuditLooksMapped(obj))
                {
                   void **vtable = *(void ***)obj;
-                  if (AuditLooksMapped(vtable))
+                  if (AuditLooksLikeVtable(vtable))
                   {
                      hx::Class cls = obj->__GetClass();
                      if (cls.GetPtr() && AuditLooksMapped(cls.GetPtr()))
                         name = cls->mName.raw_ptr();
                   }
                }
-               fprintf(audit, "missed %p %s\n", *it, name);
-               // Walk the full-mark reference path upwards: the edge that the
-               // incremental barrier missed sits somewhere on this chain.
+               fprintf(audit, "missed %p %s prebyte=%02x\n", *it, name, preByte);
+               // Walk the full-mark reference path upwards.  For each node,
+               // flag whether the INCREMENTAL mark had it (B=before-set) -
+               // the first unflagged node on a chain of flagged ones is the
+               // edge the incremental walk broke at.
                void *cur = *it;
                for(int hop=0; hop<8 && cur; hop++)
                {
@@ -6933,16 +7706,44 @@ public:
                      fprintf(audit, "   via (root/stack/header)\n");
                      break;
                   }
-                  fprintf(audit, "   via %p %s\n", parent, AuditClassName((hx::Object *)parent));
+                  fprintf(audit, "   via %c %p %s\n",
+                     before.count(parent) ? 'B' : '-',
+                     parent, AuditClassName((hx::Object *)parent));
                   cur = parent;
                }
             }
-            fprintf(audit, "cycle %d: before=%d after=%d missed=%d\n",
-               sAuditCycles, (int)before.size(), (int)after.size(), missing);
+            fprintf(audit, "cycle %d: before=%d after=%d missed=%d artifacts=%d printed=%d real=%d edges=%d\n",
+               sAuditCycles, (int)before.size(), (int)after.size(), missing, artifacts, artifactsPrinted, realMisses, sAuditEdges);
             fclose(audit);
          }
       }
       #endif
+
+      // FULL RE-MARK before the sweep.  The incremental steps' mark SET is
+      // complete (the audit real=0), but the ROW STAMPS of some marked
+      // objects are lost between the steps and this sweep (the mechanism
+      // unidentified after the full instrumentation rounds: the hole-advance,
+      // the block re-acquire, the alloc overlaps, the zeroing - all ruled
+      // out).  The sweep trusts the row stamps: a marked-but-unstamped row
+      // is freed with live objects in it, and the GC-invisible references
+      // (C++ holders of hscript objects) then dereference the freed memory
+      // (the {0, born-header} slot crash family).  The audit-mode runs -
+      // which clear all bytes and walk everything fresh at every finish -
+      // never crash.  This is that full re-mark, unconditionally: clear the
+      // bytes, walk everything from the roots, re-stamp every live row.
+      // Cost: a second full walk per finish (the first is the incremental
+      // drain above); the sweep afterwards is sound.
+      AuditClearMarks();
+      mMarker.init();
+      mMarker.isGenerational = false;
+      MarkIncrementalRoots(true);
+      #ifdef HX_MULTI_THREAD_MARKING
+      mMarker.releaseJobs();
+      StartThreadJobs(tpjMark, MAX_GC_THREADS, true);
+      #else
+      mMarker.processMarkStack();
+      #endif
+      GCTrace("finish-remarked");
 
       hx::FindZombies(mMarker);
       double tZombies = __hxcpp_time_stamp();
@@ -7064,35 +7865,101 @@ public:
    {
       GCTrace("sweep-enter");
 
+      // Late barrier chunks.  Referrer chunks can land in sGlobalChunks after
+      // the mark workers have completed: a worker's completion race (a mutator
+      // push between its last-chance check and its exit), a thread releasing
+      // its context during the finish pause, or a chunk swapped in by the
+      // weak-hash loop.  Their referrers are black hashes whose newly stored
+      // contents are still white - starting the sweep without re-walking them
+      // frees objects that live containers still point at (the missed-mark
+      // crash: Hash::__Mark walking recycled element memory, RunFinalizers on
+      // recycled finalizable objects).  We are still in the finish pause
+      // (gThreadStateChangeLock held, mutators parked), so draining here is
+      // ordered before every reclaim below, large or block.  Every
+      // mutator-reachable object is marked by the time the sweep starts.
+      {
+         int drained = 0;
+         while (true)
+         {
+            hx::MarkChunk *job = hx::sGlobalChunks.popJobLocked(0);
+            if (!job)
+               break;
+            drained++;
+            if (job->count==hx::MarkChunk::OBJ_ARRAY_JOB)
+            {
+               int n = job->arrayElements;
+               hx::Object **elems = job->arrayBase;
+               job->count = 0;
+               hx::MarkObjectArray(elems, n, &mMarker);
+            }
+            else
+            {
+               while (true)
+               {
+                  hx::Object *obj = job->pop();
+                  if (!obj)
+                     break;
+                  // Transition to the plain current id (see processMarkStack);
+                  // const allocations keep their const/nh bits.
+                  unsigned char &objMark = ((unsigned char *)obj)[HX_ENDIAN_MARK_ID_BYTE];
+                  if (!(objMark & HX_GC_CONST_ALLOC_MARK_BIT) && objMark != gByteMarkID)
+                  {
+                     objMark = gByteMarkID;
+                     MarkRowsForPlainId(obj);
+                  }
+                  obj->__Mark(&mMarker);
+               }
+            }
+            hx::sGlobalChunks.release(job);
+         }
+         if (drained)
+         {
+            mMarker.processMarkStack();
+            GCPerfLog("GC-DRAIN sweep-start: %d late referrer chunks re-walked", drained);
+         }
+      }
+
       // Sweep large objects.  They live outside the blocks and the walk is
       // cheap, so it stays in the stop-the-world part.
       for(int i=0;i<largeObjectRecycle.size();i++)
          QueueLargeFree(largeObjectRecycle[i]);
       largeObjectRecycle.setSize(0);
 
-      size_t recycleRemaining = 0;
-      #ifdef RECYCLE_LARGE
-      recycleRemaining = mLargeAllocForceRefresh;
-      #endif
+      // Resolve the large grace list from the previous sweep (see Collect's
+      // large sweep for the rationale).  Resurrected blobs go back to
+      // mLargeList with their accounting untouched; still-dead blobs release.
+      for(int i=0;i<largeGraceList.size();i++)
+      {
+         unsigned int *blob = largeGraceList[i];
+         unsigned int id = blob[1] & IMMIX_ALLOC_MARK_ID;
+         if (id==hx::gMarkID || id==hx::gStampMarkID)
+         {
+            mLargeList.push(blob);
+            if (sLargeGraceSavedLogged < 40)
+            {
+               sLargeGraceSavedLogged++;
+               GCPerfLog("LARGE-GRACE-SAVED blob=%p obj=%p size=%d byte=%02x",
+                  (void *)blob, (void *)(blob+2), (int)blob[0], id>>24);
+            }
+         }
+         else
+         {
+            mLargeAllocated -= blob[0];
+            QueueLargeFree(blob);
+         }
+      }
+      largeGraceList.setSize(0);
 
       int live = 0;
       int total = mLargeList.size();
       for(int i=0;i<total;i++)
       {
          unsigned int *blob = mLargeList[i];
-         if ( (blob[1] & IMMIX_ALLOC_MARK_ID) != hx::gMarkID )
+         if ( (blob[1] & IMMIX_ALLOC_MARK_ID) != hx::gMarkID &&
+              (blob[1] & IMMIX_ALLOC_MARK_ID) != hx::gStampMarkID )
          {
-            unsigned int size = *blob;
-            mLargeAllocated -= size;
-            if (size < recycleRemaining)
-            {
-               recycleRemaining -= size;
-               largeObjectRecycle.push(blob);
-            }
-            else
-            {
-               QueueLargeFree(blob);
-            }
+            // One cycle of grace instead of an immediate release.
+            largeGraceList.push(blob);
          }
          else
             mLargeList[live++] = blob;
@@ -7113,18 +7980,89 @@ public:
       }
 
       BeginIncrementalSweep();
-      GCTrace("sweep-begun");
+      // Complete the row sweep INSIDE the finish pause.  The lazy sweep left
+      // a window where the mutator could store an old object into a live
+      // container while the sweep was still reclaiming: the stored value was
+      // stamped (and survived), but its old children were freed when their
+      // blocks were reclaimed later in the same sweep.  No mutator runs in
+      // this pause, so sweeping to completion here closes that window
+      // entirely.  The reclaim runs on the worker pool (the same tpjReclaimFull
+      // machinery the full collect uses - a fragmented 1000+ block heap takes
+      // 15ms single-threaded, ~2-3ms across the pool), then the freed blocks
+      // are published to the free list here on the collector thread.  The
+      // byte zeroing stays deferred to zeroAndUnlock.
+      BlockDataStats sweepStats;
+      sweepStats.clear();
+      if (MAX_GC_THREADS>1)
+      {
+         for(int i=0;i<MAX_GC_THREADS;i++)
+            sThreadBlockDataStats[i].clear();
+         StartThreadJobs(tpjReclaimFull, mAllBlocks.size(), true);
+         sweepStats = sThreadBlockDataStats[0];
+         for(int i=1;i<MAX_GC_THREADS;i++)
+            sweepStats.add(sThreadBlockDataStats[i]);
+      }
+      else
+      {
+         for(int i=0;i<mAllBlocks.size();i++)
+            mAllBlocks[i]->reclaim<true>(&sweepStats);
+      }
+      for(int i=0;i<mAllBlocks.size();i++)
+      {
+         BlockDataInfo *info = mAllBlocks[i];
+         if (info->GetFreeRows()>0 && info->mMaxHoleSize>256)
+         {
+            int idx = mFreeBlocks.size();
+            mFreeBlocks.push(info);
+            for(int s=0;s<BLOCK_OFSIZE_COUNT;s++)
+               if (mNextFreeBlockOfSize[s] > idx)
+                  mNextFreeBlockOfSize[s] = idx;
+         }
+      }
+      mSweepStats = sweepStats;
+      mSweepCursor = mAllBlocks.size();
+      FinishIncrementalSweepList();
+      GCTrace("sweep-done");
    }
 
-   bool SweepActive() const { return mSweepActive; }
+    bool SweepActive() const { return mSweepActive; }
 
-   // True once every block has been handed to a sweeping thread.  The caller
-   // must hold mSweepLock before treating the statistics as final, because
-   // threads may still be reclaiming the blocks they claimed.
-   bool SweepDone()
-   {
-      return !mSweepActive || mSweepCursor >= mAllBlocks.size();
-   }
+    // Hash-walk validation (HXCPP_VALIDATE_HASH_WALK=1): binary-search the
+    // tracked block list (sorted by base pointer) to verify a pointer lands
+    // inside a managed block, or scan the large-object list (large
+    // allocations live outside blocks).  Diagnoses stale/recycled chain
+    // elements.
+    bool GcValidatePointer(void *inPtr)
+    {
+       size_t p = (size_t)inPtr;
+       int lo = 0, hi = mAllBlocks.size();
+       while (lo<hi)
+       {
+          int mid = (lo+hi)>>1;
+          size_t base = (size_t)mAllBlocks[mid]->mPtr;
+          if (p < base)
+             hi = mid;
+          else if (p >= base+IMMIX_BLOCK_SIZE)
+             lo = mid+1;
+          else
+             return true;
+       }
+       for(int i=0;i<mLargeList.size();i++)
+       {
+          unsigned int *blob = mLargeList[i];
+          if ((void *)(blob+2) == inPtr)
+             return true;
+       }
+       return false;
+    }
+
+    // True once every block has been handed to a sweeping thread.  The caller
+    // must hold mSweepLock before treating the statistics as final, because
+    // threads may still be reclaiming the blocks they claimed.
+    bool SweepDone()
+    {
+       return !mSweepActive || mSweepCursor >= mAllBlocks.size();
+    }
 
    // Lazy sweep, the way MMTk's Immix plan reclaims rows: the allocator that
    // needs a block reclaims one itself.  This spreads the sweep cost over
@@ -7167,6 +8105,18 @@ public:
 
    void BeginIncrementalSweep()
    {
+      // Report how many rows the self-heal re-marked since the last sweep.
+      static int sLastHealCount = 0;
+      if (sRowsHealed != sLastHealCount)
+      {
+         GCPerfLog("ROW-HEAL total=%d", sRowsHealed - sLastHealCount);
+         // Heal spike detector: a burst (>300 rows) means a mass stamp-loss
+         // event - dump the pre-crash state.
+         if (sRowsHealed - sLastHealCount > 300)
+            GcWriteDiagnosticDump("heal-spike");
+         sLastHealCount = sRowsHealed;
+      }
+
       // Sweep directly over mAllBlocks instead of rebuilding a snapshot
       // list: pushing thousands of entries here cost ~0.4ms of the finish
       // pause for nothing.  mAllBlocks only ever grows, and newly added
@@ -7573,17 +8523,100 @@ public:
    bool mSweepActive;
    size_t mSweepOwnedRows;
 
-   LargeList mLargeList;
-   std::mutex mLargeListLock;
-   hx::QuickVec<LocalAllocator *> mLocalAllocs;
-   LocalAllocator *mLocalPool[LOCAL_POOL_SIZE];
-   hx::QuickVec<unsigned int *> largeObjectRecycle;
+    LargeList mLargeList;
+    std::mutex mLargeListLock;
+    hx::QuickVec<LocalAllocator *> mLocalAllocs;
+    LocalAllocator *mLocalPool[LOCAL_POOL_SIZE];
+    hx::QuickVec<unsigned int *> largeObjectRecycle;
+    // Sweep-dead large blobs held for one cycle before release: a blob whose
+    // mark byte comes back current at the next sweep was wrongly judged dead
+    // (LARGE-GRACE-SAVED) and its memory was never handed out in the
+    // meantime.
+    hx::QuickVec<unsigned int *> largeGraceList;
 };
-
 
 
 namespace hx
 {
+
+// Safety probe: never faults, unlike direct header reads on wild pointers.
+static bool GcPtrProbeReadable(void *inPtr)
+{
+   MEMORY_BASIC_INFORMATION mbi;
+   if (!VirtualQuery(inPtr, &mbi, sizeof(mbi)))
+      return false;
+   if (mbi.State != MEM_COMMIT)
+      return false;
+   if (mbi.Protect & (PAGE_GUARD|PAGE_NOACCESS))
+      return false;
+   if (mbi.Protect == PAGE_READONLY)
+      return false;
+   return true;
+}
+
+bool GcHeapRangeCheck(void *inPtr)
+{
+   // Wild pointers happen (that is what this check exists for) - probe with
+   // VirtualQuery before any direct dereference.
+   MEMORY_BASIC_INFORMATION mbi;
+   if (!VirtualQuery(inPtr, &mbi, sizeof(mbi)))
+      return false;
+   if (mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_GUARD|PAGE_NOACCESS)))
+      return false;
+   // Const allocations (interned strings/enum statics) live outside the
+   // tracked blocks - their header carries the const bit, which is a valid
+   // "yes this is GC memory" answer.
+   if (((unsigned char *)inPtr)[HX_GC_CONST_ALLOC_MARK_OFFSET] & HX_GC_CONST_ALLOC_MARK_BIT)
+      return true;
+   // Everything inside the executable image (build-time string literals,
+   // static objects) is permanent - accept it.
+   if (mbi.AllocationBase == (void *)GetModuleHandleA(0))
+      return true;
+   return sGlobalAlloc && sGlobalAlloc->GcValidatePointer(inPtr);
+}
+
+// Assignment-barrier liveness check: a pointer whose allocation's start bit
+// has been cleared was freed by a sweep - the mutator is holding a stale
+// reference.  Stamping such a value would revive freed memory (and write row
+// marks through a recycled header), so the caller skips and logs it.
+bool GcAllocLiveCheck(void *inValue)
+{
+   if (!GcPtrProbeReadable(inValue))
+      return false;
+   // Const allocations live outside the tracked blocks and never die.
+   if (((unsigned char *)inValue)[HX_GC_CONST_ALLOC_MARK_OFFSET] & HX_GC_CONST_ALLOC_MARK_BIT)
+      return true;
+   size_t hdr_i = ((size_t)inValue) - sizeof(unsigned int);
+   if (!gBlockInfo)
+      return false;
+   if (!GcPtrProbeReadable((void *)(hdr_i & IMMIX_BLOCK_BASE_MASK)))
+      return false;
+   unsigned int blockId = *(unsigned int *)(hdr_i & IMMIX_BLOCK_BASE_MASK);
+   if (blockId >= gBlockInfo->size())
+      return false;
+   BlockDataInfo *info = (*gBlockInfo)[blockId];
+   if (!info || (BlockData *)info->mPtr != (BlockData *)(hdr_i & IMMIX_BLOCK_BASE_MASK))
+      return false; // id reused after destroy - stale pointer
+   int row = (int)((hdr_i & IMMIX_BLOCK_OFFSET_MASK)>>IMMIX_LINE_BITS);
+   if (row < IMMIX_HEADER_LINES || row >= IMMIX_LINES)
+      return false;
+   if (!(info->allocStart[row] & hx::gImmixStartFlag[hdr_i & 127]))
+      return false; // allocation was freed by a sweep
+   return true;
+}
+
+static int sStaleRefLogged = 0;
+void GcStaleRefLog(void *inElem)
+{
+   // Cap the log: a storm of stale assignments means a systemic
+   // use-after-free; the first hundred point at the source.
+   if (sStaleRefLogged >= 100)
+      return;
+   sStaleRefLogged++;
+#ifdef HXCPP_GC_AUDIT
+   GCAuditLog("stale-assign elem=%p count=%d", inElem, sStaleRefLogged);
+#endif
+}
 
 MarkChunk *MarkChunk::swapForNew()
 {
@@ -7774,6 +8807,13 @@ class LocalAllocator : public hx::StackContext
 
    bool           mMoreHoles;
 
+   // Allocation trace ring (span-overlap forensics): the last 64
+   // (start,size) pairs of this allocator's block-path allocations, dumped
+   // when the span guard fires.  0 start = unused slot.
+   int            mTracePos;
+   int            mTraceStart[64];
+   int            mTraceSize[64];
+
    #ifndef HXCPP_EXPLICIT_STACK_EXTENT
    int *mTopOfStack;
    int *mBottomOfStack;
@@ -7832,10 +8872,11 @@ public:
          GCLOG("Uncleaned referrers\n");
       }
 
-      if (sGcMode==gcmGenerational)
-         mOldReferrers = hx::sGlobalChunks.alloc();
-      else
-         mOldReferrers = hx::gIncrementalMarking ? hx::sGlobalChunks.alloc() : 0;
+      // Always hand the context a chunk: CallAlloc queues born containers
+      // through it during incremental cycles, and a null chunk here silently
+      // drops every container a thread attached between cycles allocates
+      // until the next begin (the born-container window at thread attach).
+      mOldReferrers = hx::sGlobalChunks.alloc();
       #endif
 
 
@@ -7901,6 +8942,9 @@ public:
       spaceStart = 0;
       #endif
       mMoreHoles = false;
+      mTracePos = 0;
+      memset(mTraceStart, 0, sizeof(mTraceStart));
+      memset(mTraceSize, 0, sizeof(mTraceSize));
    }
 
    // The main of haxe calls SetTopOfStack(top,false)
@@ -8307,12 +9351,116 @@ public:
                unsigned int *buffer = (unsigned int *)(allocBase + spaceStart);
 
                int startRow = spaceStart>>IMMIX_LINE_BITS;
-               allocStartFlags[ startRow ] |= hx::gImmixStartFlag[spaceStart &127];
-
                int endRow = (end+(IMMIX_LINE_LEN-1))>>IMMIX_LINE_BITS;
 
-               *buffer++ = inObjectFlags | hx::gMarkID |
+               // OVERLAP GUARD (span): the WHOLE [spaceStart,end) range must
+               // be free.  A set bit anywhere inside means the bump cursor
+               // advanced into live data - the 4-byte-short step that puts a
+               // born header inside the previous object's pointer slot (the
+               // {0, header} slot signature from the 3924/32416 dumps).  The
+               // row masks cover exactly the touched bytes: the end row is
+               // (end-1)>>7 inclusive, and the partial rows only test their
+               // covered slots (the earlier version overshot the end row and
+               // produced false positives).
+               {
+                  bool spanHit = false;
+                  int lastRow = (end-1) >> IMMIX_LINE_BITS;
+                  for(int rr=startRow; rr<=lastRow && !spanHit; rr++)
+                  {
+                     unsigned int bits = allocStartFlags[rr];
+                     if (!bits)
+                        continue;
+                     int from = (rr==startRow) ? (spaceStart & (IMMIX_LINE_LEN-1)) : 0;
+                     int lastByte = (rr==lastRow) ? ((end-1) & (IMMIX_LINE_LEN-1))
+                                                  : (IMMIX_LINE_LEN-1);
+                     unsigned int mask = 0;
+                     for(int b=from; b<=lastByte; b+=4)
+                        mask |= hx::gImmixStartFlag[b];
+                     if (bits & mask)
+                        spanHit = true;
+                  }
+                  if (spanHit)
+                  {
+                     static int sOverlapLogged = 0;
+                     if (sOverlapLogged < 40)
+                     {
+                        sOverlapLogged++;
+                        unsigned int prevHdr = ((unsigned int *)(allocBase + spaceStart))[0];
+                        unsigned int beforeHdr = ((unsigned int *)(allocBase + spaceStart))[-1];
+                        GCPerfLog("ALLOC-SPAN-OVERLAP alloc=%p block=%p row=%d startByte=%d size=%d prevHdr=%08x beforeHdr=%08x newHdr=%08x",
+                           (void *)this, (void *)allocBase, startRow, (spaceStart&127), allocSize, prevHdr, beforeHdr,
+                           inObjectFlags | hx::gStampMarkID |
+                           (inSize<<IMMIX_ALLOC_SIZE_SHIFT) | (lastRow+1-startRow));
+                        // Dump the allocation trace ring: the last 64
+                        // (start,size) pairs show the exact sequence that led
+                        // to the short step.
+                        GCPerfLog("ALLOC-TRACE alloc=%p begin", (void *)this);
+                        for(int t=0;t<64;t++)
+                        {
+                           int idx = (mTracePos + t) & 63;
+                           if (mTraceStart[idx])
+                              GCPerfLog("   [%02d] start=%d size=%d", idx, mTraceStart[idx], mTraceSize[idx]);
+                        }
+                        GCPerfLog("ALLOC-TRACE alloc=%p end", (void *)this);
+                     }
+                     // DEFENSIVE: do NOT allocate over the overlapping data -
+                     // the born header would land inside the previous object's
+                     // pointer slot (the hscript-locals {0, header} crash).
+                     // Skip forward past the last touched row and retry; the
+                     // skipped space is a bounded loss, the overlap victims
+                     // survive.
+                     spaceStart = (lastRow+1) << IMMIX_LINE_BITS;
+                     continue;
+                  }
+               }
+               allocStartFlags[ startRow ] |= hx::gImmixStartFlag[spaceStart &127];
+
+               // Trace ring for span-overlap forensics.
+               mTraceStart[mTracePos] = spaceStart;
+               mTraceSize[mTracePos] = allocSize;
+               mTracePos = (mTracePos + 1) & 63;
+
+               // Born-stamped: the 0x30-prefixed twin of the current id
+               // (see the comment in GC.h).  A born container's old children
+               // are covered by the assign barrier (each store queues the
+               // child); the born object itself is descended when the walk
+               // first reaches it, because the dedup skips only the plain id.
+               *buffer++ = inObjectFlags | hx::gStampMarkID |
                      (inSize<<IMMIX_ALLOC_SIZE_SHIFT) | (endRow-startRow);
+
+               // Born-marked rows: the allocation is born with the current
+               // mark id in its header, but the SWEEP decides per ROW
+               // (rowMarked), and a born allocation's row marks are not set
+               // by anything until a mark walk touches it.  The assignment
+               // barrier's mark (and Hash.h's HX_MARK_ARRAY) skip objects
+               // whose byte already equals the current id, so a born-black
+               // object whose container was walked BEFORE the store never
+               // gets its row marks - the moment its block leaves the
+               // allocator's ownership, the sweep sees rowMarked==0 and
+               // frees the whole row while live containers still refer to
+               // the object (the recycled hash bucket-array / chain-element
+               // crashes).  Stamp the rows at birth.
+               {
+                  char *rowMark = (char *)allocBase + startRow;
+                  for(int r=0; r<(endRow-startRow); r++)
+                     rowMark[r] = 1;
+               }
+
+               // Queue born containers for a walk.  The assign barrier skips
+               // values whose low nibble matches the current cycle (it assumes
+               // "stamped" means "already queued"), which is true for
+               // barrier-stamped values but NOT for born ones: a container
+               // born during the cycle and stored into an already-walked
+               // container was never queued and never walked, so its own
+               // children were missed at the sweep (the audit's artifact
+               // chains: TextEngine->ShapeCache->StringMap->Array (all marked)
+               // -> GlyphPosition (unmarked) -> Vector2 (freed under it) - the
+               // GlyphPosition/Vector2 crash family).  Queuing at birth makes
+               // "stamped means queued" true for both sources; the finish
+               // walks every born container once and marks its subtree.
+               if ( (inObjectFlags & IMMIX_ALLOC_IS_CONTAINER) &&
+                    hx::gIncrementalMarking && mOldReferrers )
+                  pushReferrer((hx::Object *)buffer);
 
                spaceStart = end;
 
@@ -8341,8 +9489,22 @@ public:
             spaceFirst = allocBase + mCurrentRange[mCurrentHole].start + sizeof(int);
             spaceOversize = spaceFirst + mCurrentRange[mCurrentHole].length;
             #else
-            spaceStart = mCurrentRange[mCurrentHole].start;
-            spaceEnd = spaceStart + mCurrentRange[mCurrentHole].length;
+            {
+               int oldStart = spaceStart;
+               spaceStart = mCurrentRange[mCurrentHole].start;
+               spaceEnd = spaceStart + mCurrentRange[mCurrentHole].length;
+               // Cursor-transition log: a rewind (new start < old start, same
+               // block) means the ranges were rebuilt while the allocator
+               // iterated them - the born containers in the skipped gap get
+               // allocated over (the path-string trampling signature).
+               static int sHoleAdvLogged = 0;
+               if (spaceStart < oldStart && sHoleAdvLogged < 30)
+               {
+                  sHoleAdvLogged++;
+                  GCPerfLog("HOLE-REWIND alloc=%p block=%p oldStart=%d newStart=%d hole=%d",
+                     (void *)this, (void *)allocBase, oldStart, spaceStart, mCurrentHole);
+               }
+            }
             #endif
             mCurrentHole++;
             mMoreHoles = mCurrentHole<mCurrentHoles;
@@ -8361,20 +9523,34 @@ public:
 
             BlockDataInfo *info = sGlobalAlloc->GetFreeBlock(allocSize,this);
 
-            allocBase = (unsigned char *)info->mPtr;
-            mCurrentRange = info->mRanges;
-            allocStartFlags = info->allocStart;
-            mCurrentHoles = info->mHoles;
-            mFraggedRows = &info->mFraggedRows;
-            #ifdef HXCPP_GC_NURSERY
-            spaceFirst = allocBase + mCurrentRange->start + sizeof(int);
-            spaceOversize = spaceFirst + mCurrentRange->length;
-            #else
-            spaceStart = mCurrentRange->start;
-            spaceEnd = spaceStart + mCurrentRange->length;
-            #endif
-            mCurrentHole = 1;
-            mMoreHoles = mCurrentHole<mCurrentHoles;
+            // Acquire log: pair with the span-overlap hits - a re-acquire of
+            // the same block whose range start is BELOW the allocator's last
+            // cursor is the mid-fill rewind that tramples born objects.
+            {
+               static int sAcqLogged = 0;
+               unsigned char *oldBase = allocBase;
+               int oldStart = spaceStart;
+               allocBase = (unsigned char *)info->mPtr;
+               mCurrentRange = info->mRanges;
+               allocStartFlags = info->allocStart;
+               mCurrentHoles = info->mHoles;
+               mFraggedRows = &info->mFraggedRows;
+               #ifdef HXCPP_GC_NURSERY
+               spaceFirst = allocBase + mCurrentRange->start + sizeof(int);
+               spaceOversize = spaceFirst + mCurrentRange->length;
+               #else
+               spaceStart = mCurrentRange->start;
+               spaceEnd = spaceStart + mCurrentRange->length;
+               #endif
+               mCurrentHole = 1;
+               mMoreHoles = mCurrentHole<mCurrentHoles;
+               if (sAcqLogged < 30 && oldBase == allocBase && spaceStart < oldStart)
+               {
+                  sAcqLogged++;
+                  GCPerfLog("BLOCK-REACQUIRE alloc=%p block=%p oldStart=%d newStart=%d size=%d",
+                     (void *)this, (void *)allocBase, oldStart, spaceStart, allocSize);
+               }
+            }
          }
 
          // Other thread may have started collect, in which case we may just
@@ -8596,6 +9772,7 @@ void InitAlloc()
    for(int i=0;i<IMMIX_LINE_LEN;i++)
       gImmixStartFlag[i] = 1<<( i>>2 ) ;
 
+   GcExeImageRange();
    hx::CommonInitAlloc();
    sgAllocInit = true;
    sGlobalAlloc = new GlobalAllocator();
@@ -8674,6 +9851,16 @@ void *InternalNew(int inSize,bool inIsObject)
    if (inSize>=IMMIX_LARGE_OBJ_SIZE)
    {
       void *result = sGlobalAlloc->AllocLarge(inSize, true);
+      // Born large containers need the same walk-at-finish queueing as the
+      // block-path ones (AllocLarge stamps them born-black; a store into an
+      // already-walked container is then skipped by the barrier's nibble
+      // check, and the large object's children would be missed).
+      if (inIsObject && hx::gIncrementalMarking)
+      {
+         LocalAllocator *tla = GetLocalAlloc();
+         if (tla && tla->mOldReferrers)
+            tla->pushReferrer((hx::Object *)result);
+      }
       return result;
    }
    else
@@ -9241,10 +10428,10 @@ bool __hxcpp_gc_frame_tick(int inBudgetMicros, bool inAllowFull, double inFrameM
          return true;
       }
 
-      // The worker drains the mark stack; the main thread only checks whether
-      // it is finished and then pays the short finishing pause.
-      if (sGlobalAlloc->BackgroundMarkFinished())
-         sGlobalAlloc->FinishIncremental();
+      // STW budgeted mark step (the mutators park for the step; the assign
+      // barrier covers their stores between steps).  StepIncremental calls
+      // FinishIncremental itself once the mark stack drains.
+      sGlobalAlloc->StepIncremental(budget);
       return true;
    }
 

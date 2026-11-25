@@ -228,6 +228,21 @@ bool IsWeakRefValid(const HX_CHAR *inPtr);
 //  that points to real, active objects.
 void MarkConservative(int *inBottom, int *inTop,hx::MarkContext *__inCtx);
 
+// Hash-walk validation (HXCPP_VALIDATE_HASH_WALK=1): the mutator-side chain
+// walk checks that every element lands inside a tracked GC block, logging and
+// skipping stale links instead of dereferencing recycled memory.  Diagnostic
+// switches for the concurrent-mutator crash hunt.
+HXCPP_EXTERN_CLASS_ATTRIBUTES bool GcWalkValidationEnabled(void);
+HXCPP_EXTERN_CLASS_ATTRIBUTES bool GcHeapRangeCheck(void *inPtr);
+// Re-install the GC crash-dump filter (the engine's own handler may have
+// replaced it via SetUnhandledExceptionFilter - last call wins).  The
+// engine calls this once from its first tick.
+void __hxcpp_gc_reinstall_dump_filter();
+HXCPP_EXTERN_CLASS_ATTRIBUTES bool GcAllocLiveCheck(void *inPtr);
+HXCPP_EXTERN_CLASS_ATTRIBUTES void GcBadLinkLog(void *inElem, void *inHash);
+HXCPP_EXTERN_CLASS_ATTRIBUTES void GcStaleRefLog(void *inElem);
+HXCPP_EXTERN_CLASS_ATTRIBUTES bool GcEnvFlagCached(const char *inName);
+
 
 // Create/Remove a root.
 // All statics are explicitly registered - this saves adding the whole data segment
@@ -383,8 +398,31 @@ EXTERN_FAST_TLS_DATA(StackContext, tlsStackContext);
 extern StackContext *gMainThreadContext;
 
 extern unsigned int gImmixStartFlag[128];
+// The exe image's [base,end) range, cached at GC init.  Strings can adopt
+// raw pointers into it (static literals via String(ptr,len)); marking such
+// a pointer would stamp the read-only .rdata page and crash.  Pointers
+// inside this range are permanent: skip them in the mark entries.
+extern unsigned char *gExeImageBase;
+extern unsigned char *gExeImageEnd;
+// The managed block region [low,high): every 16K block lives inside it.
+// Mark entries use it as a fast filter - pointers inside go straight to the
+// stamp path, pointers outside (statics, C++ heap, freed VAs) get the exact
+// GcHeapRangeCheck before being touched.
+extern unsigned char *gBlockRegionLow;
+extern unsigned char *gBlockRegionHigh;
 extern int gMarkID;
 extern int gMarkIDWithContainer;
+// Stamped-this-cycle id: born-black allocations (CallAlloc) and the assign
+// barriers carry 0x30-prefixed mark ids instead of the plain current id.
+// Real ids only ever use the 0x10/0x20 prefixes, so 0x30 never collides.
+// "Stamped" means alive-for-this-cycle but NOT yet walked: the marker's
+// plain-id dedup descends stamped objects, which closes the subtrees of
+// objects the barrier stamped without walking (the old stamp-only barrier
+// let the sweep free their unreached children).  The marker's pop-site
+// transitions stamped objects to the plain current id, which is what makes
+// the dedup skip them afterwards.
+extern int gStampMarkID;
+extern int gStampByteMarkID;
 extern void BadImmixAlloc();
 
 
@@ -563,9 +601,42 @@ inline void MarkAlloc(void *inPtr ,hx::MarkContext *__inCtx)
    // Unaligned must be constants...
    if ( !( ((size_t)inPtr) & 3) )
    #endif
-   // This will also skip const regions
-   if ( !(((unsigned int *)inPtr)[-1] & gPrevMarkIdMask) )
-      MarkAllocUnchecked(inPtr,__inCtx);
+   // Walk validation (HXCPP_VALIDATE_HASH_WALK=1): a pointer outside every
+   // tracked block is a stale/recycled reference - log and skip instead of
+   // dereferencing (the validation mode is diagnostic; it also keeps the
+   // run alive to collect more samples).
+   if (::hx::GcWalkValidationEnabled())
+   {
+      if (inPtr && !::hx::GcHeapRangeCheck(inPtr))
+      {
+         ::hx::GcBadLinkLog(inPtr, 0);
+         return;
+      }
+   }
+   // Skip const regions and allocations that already carry the full current
+   // mark id.  The old gPrevMarkIdMask check skipped on the alternating
+   // parity bit alone, which left objects marked in the previous cycle
+   // unmarked - and the sweep's per-allocation id check then freed them
+   // while live containers (a Hash, the finalizer list) still referenced
+   // them.  Also skip exe-image pointers: static literals adopted via
+   // String(ptr,len) have no const marker, and stamping them would write
+   // the read-only .rdata page.
+   //  Pointers OUTSIDE the managed block region are foreign (statics, the
+   //  C++ heap, freed VAs) or large allocations - they get the exact
+   //  GcHeapRangeCheck before being touched.  Without this, a stale
+   //  reference held by C++ code gets stamped and tramples whatever the
+   //  address now contains (the differential proof: with the validator's
+   //  rejection on, ROW-HEAL dropped 9055 -> 1 and the boot crash vanished).
+   if ( !(((unsigned int *)inPtr)[-1] & HX_GC_CONST_ALLOC_BIT) &&
+        !((unsigned char *)inPtr >= hx::gExeImageBase && (unsigned char *)inPtr < hx::gExeImageEnd) &&
+        ((((unsigned char *)inPtr)[HX_ENDIAN_MARK_ID_BYTE]) & 0x3f) != (hx::gByteMarkID & 0x3f) )
+   {
+      if ( (unsigned char *)inPtr >= hx::gBlockRegionLow &&
+           (unsigned char *)inPtr <  hx::gBlockRegionHigh )
+         MarkAllocUnchecked(inPtr,__inCtx);
+      else if ( ::hx::GcHeapRangeCheck(inPtr) )
+         MarkAllocUnchecked(inPtr,__inCtx);
+   }
 }
 inline void MarkObjectAlloc(hx::Object *inPtr ,hx::MarkContext *__inCtx)
 {
@@ -573,9 +644,28 @@ inline void MarkObjectAlloc(hx::Object *inPtr ,hx::MarkContext *__inCtx)
    // Unaligned must be constants...
    if ( !( ((size_t)inPtr) & 3) )
    #endif
-   // This will also skip const regions
-   if ( !(((unsigned int *)inPtr)[-1] & gPrevMarkIdMask) )
-      MarkObjectAllocUnchecked(inPtr,__inCtx);
+   // Walk validation: same stale/recycled field guard as MarkAlloc above.
+   if (::hx::GcWalkValidationEnabled())
+   {
+      if (inPtr && !::hx::GcHeapRangeCheck(inPtr))
+      {
+         ::hx::GcBadLinkLog(inPtr, 0);
+         return;
+      }
+   }
+   // Skip const regions, exe-image pointers and objects that already carry
+   // the full current mark id (see MarkAlloc above).  Outside-region
+   // pointers (large allocations) get the exact GcHeapRangeCheck.
+   if ( !(((unsigned int *)inPtr)[-1] & HX_GC_CONST_ALLOC_BIT) &&
+        !((unsigned char *)inPtr >= hx::gExeImageBase && (unsigned char *)inPtr < hx::gExeImageEnd) &&
+        ((((unsigned char *)inPtr)[HX_ENDIAN_MARK_ID_BYTE]) & 0x3f) != (hx::gByteMarkID & 0x3f) )
+   {
+      if ( (unsigned char *)inPtr >= hx::gBlockRegionLow &&
+           (unsigned char *)inPtr <  hx::gBlockRegionHigh )
+         MarkObjectAllocUnchecked(inPtr,__inCtx);
+      else if ( ::hx::GcHeapRangeCheck(inPtr) )
+         MarkObjectAllocUnchecked(inPtr,__inCtx);
+   }
 }
 
 

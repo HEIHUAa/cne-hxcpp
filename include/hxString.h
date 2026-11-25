@@ -141,7 +141,31 @@ public:
     String(const Dynamic &inRHS);
 
     inline ::String &operator=(const ::String &inRHS)
-           { length = inRHS.length; __s = inRHS.__s; return *this; }
+    {
+       // Incremental-GC assignment barrier for the string data (the recycled-
+       // memory crash applies to string data too - the audit's "?" entries).
+       // MarkAllocUnchecked stamps the data allocation's mark byte + row marks
+       // and skips const/interned and already-marked data internally; it never
+       // touches the context in the non-nursery path.  No contents re-walk is
+       // needed - strings hold no pointers.
+       if (!::hx::GcEnvFlagCached("HXCPP_ASSIGN_BARRIER_OFF") &&
+           ::hx::gIncrementalMarking && inRHS.__s)
+       {
+          unsigned char &mark = ((unsigned char *)inRHS.__s)[HX_ENDIAN_MARK_ID_BYTE];
+          // The low nibble covers the plain id and its stamped twin.
+          if ( !(((unsigned int *)inRHS.__s)[-1] & HX_GC_CONST_ALLOC_BIT) &&
+               ((mark & 0x0f) != (::hx::gByteMarkID & 0x0f)) )
+          {
+             if (!::hx::GcAllocLiveCheck((void *)inRHS.__s))
+                ::hx::GcStaleRefLog((void *)inRHS.__s);
+             else
+                ::hx::MarkAllocUnchecked((void *)inRHS.__s, 0);
+          }
+       }
+       length = inRHS.length;
+       __s = inRHS.__s;
+       return *this;
+    }
 
    ::String Default(const ::String &inDef) { return __s ? *this : inDef; }
 

@@ -268,12 +268,61 @@ public:
 // This class simply provides syntax so that pointers can be written as objects,
 //  and overloaded operators can be used
 
+// Incremental-GC assignment barrier.  The generated code stores object fields
+// and array elements with plain assignments (no HX_OBJ_WB anywhere in the
+// generated sources), so a value can be moved into a container that the
+// marker has already walked: the marker then never sees that edge, the sweep
+// frees the value while the container still refers to it, and the next cycle
+// reads recycled memory.  The barrier stamps the value with the
+// stamped-this-cycle id (0x30-prefixed - alive this cycle, NOT walked) and
+// queues it for a re-walk at the finish drain.  The drain runs inside the
+// finish pause, before the sweep (which also completes inside that pause), so
+// the queued value and its unreached children are all intact and get marked.
+// The walk's dedup skips only the plain current id, which the marker writes
+// when it actually walks an object - so a stamped value is always descended.
+static inline void ObjectAssignWriteBarrier(hx::Object *inValue)
+{
+   if (::hx::GcEnvFlagCached("HXCPP_ASSIGN_BARRIER_OFF"))
+      return;
+   // Native threads without a GC context (video codec callbacks, foreign
+   // libraries) must not touch GC metadata at all: there is no context to
+   // queue into, and stamping rows would race the collector's own
+   // bookkeeping (those threads do not park at safepoints).  Their stores
+   // are covered exactly like the original no-barrier code.
+   hx::StackContext *__wbCtx = HX_CTX_GET;
+   if (!__wbCtx)
+      return;
+   if (::hx::gIncrementalMarking && inValue)
+   {
+      unsigned char &mark = ((unsigned char *)inValue)[HX_ENDIAN_MARK_ID_BYTE];
+      // The low nibble is shared by the plain id and its stamped twin: a
+      // value carrying either was stamped-and-queued (or walked) earlier this
+      // cycle, so skip it here.
+      if ( !(((unsigned int *)inValue)[-1] & HX_GC_CONST_ALLOC_BIT) &&
+           ((mark & 0x0f) != (::hx::gByteMarkID & 0x0f)) )
+      {
+         // A value whose allocation start-bit was cleared was freed by a
+         // sweep - the mutator is storing a stale reference.  Stamping it
+         // would revive freed memory (and write row marks through a recycled
+         // header), so skip and log instead.
+         if (!::hx::GcAllocLiveCheck(inValue))
+         {
+            ::hx::GcStaleRefLog(inValue);
+            return;
+         }
+         hx::MarkAllocUnchecked(inValue, 0);
+         __wbCtx->pushReferrer(inValue);
+      }
+   }
+}
+
 template<typename OBJ_>
 class ObjectPtr
 {
 protected:
    inline bool SetPtr(OBJ_ *inPtr)
    {
+      ObjectAssignWriteBarrier(inPtr);
       mPtr = inPtr;
       return true;
    }
@@ -283,6 +332,7 @@ protected:
    {
       if (inPtr)
       {
+         ObjectAssignWriteBarrier(inPtr);
          mPtr = inPtr->_hx_isInstanceOf(OBJ_::_hx_ClassId) ? reinterpret_cast<OBJ_*>(inPtr) : 0;
 
          if (inThrowOnInvalid && !mPtr)
@@ -331,9 +381,19 @@ public:
              ,inCheckCast);
    }
 
+   // Incremental-GC assignment barrier.  The generated code stores object
+   // fields and array elements with plain assignments (no HX_OBJ_WB), so a
+   // value the concurrent marker has not reached yet can be moved into a
+   // container that has already been walked.  The marker then never sees
+   // that edge, the sweep frees the value while the container still refers
+   // to it, and the next cycle reads recycled memory (the Hash::find /
+   // Hash::__Mark poison crashes).  Marking the value on every pointer
+   // assignment during a cycle is conservative and complete: fresh values
+   // are already marked (cheap skip), null skips, and anything old the
+   // mutator touches survives to be walked properly (and dies next cycle).
    inline ObjectPtr &operator=(const null &inNull) { mPtr = 0; return *this; }
-   inline ObjectPtr &operator=(Ptr inRHS) { mPtr = inRHS; return *this; }
-   inline ObjectPtr &operator=(const ObjectPtr &inRHS) { mPtr = inRHS.mPtr; return *this; }
+   inline ObjectPtr &operator=(Ptr inRHS) { ObjectAssignWriteBarrier(inRHS); mPtr = inRHS; return *this; }
+   inline ObjectPtr &operator=(const ObjectPtr &inRHS) { ObjectAssignWriteBarrier(inRHS.mPtr); mPtr = inRHS.mPtr; return *this; }
    template<typename InterfaceImpl>
    inline ObjectPtr &operator=(InterfaceImpl *inRHS)
    {

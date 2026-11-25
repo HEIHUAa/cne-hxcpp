@@ -1,4 +1,4 @@
-#include <stdio.h>
+﻿#include <stdio.h>
 #include <stdlib.h>
 
 #ifdef HXCPP_TELEMETRY
@@ -347,16 +347,16 @@ struct Hash : public HashBase< typename ELEMENT::Key >
    // The re-link loop holds no safepoints and completes in microseconds, so
    // a concurrent marker simply spins until it is done; the STW pause can
    // only park this thread outside the region, where the table is whole.
-   volatile int rehashing;
+    volatile int rehashing;
 
 
-   Hash() : HashBase<Key>( StoreOf<Value>::store )
-   {
-      bucket = 0;
-      rehashing = 0;
-      if (ELEMENT::WeakKeys && Element::ManageKeys)
-         RegisterWeakHash(this);
-   }
+    Hash() : HashBase<Key>( StoreOf<Value>::store )
+    {
+       bucket = 0;
+       rehashing = 0;
+       if (ELEMENT::WeakKeys && Element::ManageKeys)
+          RegisterWeakHash(this);
+    }
 
    template<typename T>
    bool TIsWeakRefValid(T &) { return true; }
@@ -574,6 +574,11 @@ struct Hash : public HashBase< typename ELEMENT::Key >
       Element *head = bucket[inHash & mask];
       while(head)
       {
+         if (::hx::GcWalkValidationEnabled() && !::hx::GcHeapRangeCheck((void *)head))
+         {
+            ::hx::GcBadLinkLog((void *)head, (void *)this);
+            return 0;
+         }
          if ( (IgnoreHash || head->getHash()==inHash) && head->key==inKey)
             return head;
          head = head->next;
@@ -638,6 +643,11 @@ struct Hash : public HashBase< typename ELEMENT::Key >
       Element *head = bucket[inHash & mask];
       while(head)
       {
+         if (::hx::GcWalkValidationEnabled() && !::hx::GcHeapRangeCheck((void *)head))
+         {
+            ::hx::GcBadLinkLog((void *)head, (void *)this);
+            return false;
+         }
          if ( (IgnoreHash || head->getHash()==inHash) && inFinder==head->key)
          {
             outKey = head->key;
@@ -686,11 +696,16 @@ struct Hash : public HashBase< typename ELEMENT::Key >
       // Incremental marking: any insertion can create a black->white edge
       // (a fresh String key, or an old key that has not been marked yet).
       // Record the hash; the worker that picks the chunk up re-scans it
-      // promptly.
+      // promptly.  Native threads without a GC context must not touch GC
+      // metadata (same rule as ObjectAssignWriteBarrier).
       if (::hx::gIncrementalMarking && mark == hx::gByteMarkID)
       {
-         mark|=HX_GC_REMEMBERED;
-         (HX_CTX_GET)->pushReferrer(this);
+         hx::StackContext *__wbCtx = HX_CTX_GET;
+         if (__wbCtx)
+         {
+            mark|=HX_GC_REMEMBERED;
+            __wbCtx->pushReferrer(this);
+         }
       }
       #else
       if (mark == hx::gByteMarkID)
@@ -731,6 +746,11 @@ struct Hash : public HashBase< typename ELEMENT::Key >
          Element *el = bucket[b];
          while(el)
          {
+            if (::hx::GcWalkValidationEnabled() && !::hx::GcHeapRangeCheck((void *)el))
+            {
+               ::hx::GcBadLinkLog((void *)el, (void *)this);
+               break;
+            }
             inFunc(el);
             el = el->next;
          }
@@ -874,6 +894,11 @@ struct Hash : public HashBase< typename ELEMENT::Key >
       HashMarker(hx::MarkContext *ctx) : __inCtx(ctx) { }
       void operator()(typename Hash::Element *inElem)
       {
+         if (::hx::GcWalkValidationEnabled() && !::hx::GcHeapRangeCheck((void *)inElem))
+         {
+            ::hx::GcBadLinkLog((void *)inElem, 0);
+            return;
+         }
          HX_MARK_ARRAY(inElem);
          if (!Hash::Element::WeakKeys)
          {
@@ -885,10 +910,11 @@ struct Hash : public HashBase< typename ELEMENT::Key >
 
    void __Mark(hx::MarkContext *__inCtx) HXCPP_OVERRIDE
    {
-      // A concurrent marker must not walk a half-rehashed table - the
-      // re-link loop has no safepoints and finishes in microseconds, so
-      // spin it out.  The STW pause can only park the rehashing thread
-      // outside the region, so this also holds during the finish.
+      // A marker must not walk a half-rehashed table - the re-link loop has
+      // no safepoints and finishes in microseconds, so spin it out.  With
+      // STW budgeted mark steps the world is paused for the whole walk, so
+      // the spin always passes immediately; the flag remains for the
+      // mutator-side find()/TSet() paths.
       while (rehashing) { }
 
       HX_MARK_ARRAY(bucket);
