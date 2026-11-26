@@ -5122,7 +5122,8 @@ public:
          int markCalls = (int)sgMarkCalls;
          sgArrayMarkCount = 0;
          sgMarkCalls = 0;
-         GCPerfLog("marksplit init=%.3f statics=%.3f roots=%.3f zombies=%.3f locals=%.3f drain=%.3f weakfin=%.3f total=%.3f rootsN=%d stacks=%d arrayN=%d markCalls=%d",
+         GCPerfLog("t=%.2f marksplit init=%.3f statics=%.3f roots=%.3f zombies=%.3f locals=%.3f drain=%.3f weakfin=%.3f total=%.3f rootsN=%d stacks=%d arrayN=%d markCalls=%d",
+            mT0,
             (mT1-mT0)*1000, (mT2-mT1)*1000, (mT3-mT2)*1000, (mT4-mT3)*1000,
             (mT5-mT4)*1000, (mT6-mT5)*1000, (mT7-mT6)*1000, (mT7-mT0)*1000,
             rootsN, (int)mLocalAllocs.size(), arrayN, markCalls);
@@ -5660,10 +5661,11 @@ public:
 
       {
          double tPerfEnd = __hxcpp_time_stamp();
-         GCPerfLog("collect total=%.3f mark=%.3f reclaim=%.3f large=%.3f stats=%.3f freelist=%.3f used=%d blocks=%d",
+         GCPerfLog("t=%.2f collect total=%.3f mark=%.3f reclaim=%.3f large=%.3f stats=%.3f freelist=%.3f used=%d blocks=%d largeBytes=%d",
+            tPerf0,
             (tPerfEnd-tPerf0)*1000, (tPerfMark-tPerf0)*1000, (tPerfReclaim-tPerfMark)*1000,
             (tPerfLarge-tPerfReclaim)*1000, (tPerfStats-tPerfLarge)*1000, (tPerfEnd-tPerfStats)*1000,
-            (int)MemUsage(), (int)mAllBlocks.size());
+            (int)MemUsage(), (int)mAllBlocks.size(), (int)mLargeAllocated);
       }
 
       mAllBlocksCount   = mAllBlocks.size();
