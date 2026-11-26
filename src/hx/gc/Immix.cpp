@@ -86,6 +86,55 @@ static void GCPerfLog(const char *inFormat, ...)
    fclose(f);
 }
 
+// --- Live-object census (diagnostic) ----------------------------------------
+// Between census-begin (flag set) and census-end the mark path records every
+// first-visit container object (hx::Object) keyed by class: instance count +
+// approximate bytes (rows * line length, so header/padding slack included).
+// Outside census runs the only cost is one predictable never-taken branch in
+// the mark path.  __hxcpp_gc_census_dump (Haxe: GcCensus.dump) runs one full
+// collect with the flag on and writes the top classes to gc_census.log.
+struct GcCensusSlot { void *cls; int count; int bytes; };
+#define GC_CENSUS_SLOTS 8192
+static GcCensusSlot sgCensus[GC_CENSUS_SLOTS];
+static volatile int sCensusActive = 0;
+static volatile int sCensusOverflow = 0;
+static volatile int sCensusNoClassCount = 0;
+static volatile int sCensusNoClassBytes = 0;
+static volatile int sCensusRawCount = 0;
+static volatile int sCensusRawBytes = 0;
+
+static void gcCensusRecord(void *cls, int approxBytes)
+{
+   if (!cls)
+   {
+      _hx_atomic_add(&sCensusNoClassCount, 1);
+      _hx_atomic_add(&sCensusNoClassBytes, approxBytes);
+      return;
+   }
+   unsigned h = (unsigned)(((size_t)cls) >> 4) & (GC_CENSUS_SLOTS-1);
+   for (int probe=0; probe<16; probe++)
+   {
+      GcCensusSlot &slot = sgCensus[(h+probe) & (GC_CENSUS_SLOTS-1)];
+      if (slot.cls == cls)
+      {
+         _hx_atomic_add(&slot.count, 1);
+         _hx_atomic_add(&slot.bytes, approxBytes);
+         return;
+      }
+      if (!slot.cls)
+      {
+         void *old = _hx_atomic_compare_exchange_ptr((volatile void **)&slot.cls, 0, cls);
+         if (old == 0 || old == cls)
+         {
+            _hx_atomic_add(&slot.count, 1);
+            _hx_atomic_add(&slot.bytes, approxBytes);
+            return;
+         }
+      }
+   }
+   _hx_atomic_add(&sCensusOverflow, 1);
+}
+
 // Bisection switches: setting the env var to 1 disables one subsystem at a
 // time so a crashing run can be narrowed down.
 static bool gcBisectFlag(const char *inName)
@@ -2423,6 +2472,9 @@ void MarkObjectAllocUnchecked(hx::Object *inPtr,hx::MarkContext *__inCtx)
          sObjectMarks++;
          #endif
 
+         if (sCensusActive)
+            gcCensusRecord(inPtr->__GetClass().GetPtr(), (int)rows * IMMIX_LINE_LEN);
+
          #ifdef HXCPP_DEBUG
             if (gCollectTrace && gCollectTrace==inPtr->__GetClass().GetPtr())
             {
@@ -2458,6 +2510,14 @@ void MarkObjectAllocUnchecked(hx::Object *inPtr,hx::MarkContext *__inCtx)
          #ifdef PROFILE_COLLECT
          sAllocMarks++;
          #endif
+         // Raw (non-container) block allocs, e.g. string buffers: aggregate
+         // bytes only, they have no class.  Completes the byte split:
+         // largeBytes (native log) + rawBytes + census object bytes ~= used.
+         if (sCensusActive)
+         {
+            _hx_atomic_add(&sCensusRawCount, 1);
+            _hx_atomic_add(&sCensusRawBytes, (int)rows * IMMIX_LINE_LEN);
+         }
       }
 
    // MARK_ROWS_UNCHECKED_END
@@ -7294,6 +7354,80 @@ Dynamic _hx_gc_freeze(Dynamic inObject)
 }
 
 
+
+// Live-object census: one full collect with the census flag on, then dump the
+// per-class table (count + approx bytes) to gc_census.log.  Haxe side logs the
+// blob caches (bitmap/assets) into the same file around this call.
+void __hxcpp_gc_census_dump()
+{
+   if (!sGlobalAlloc)
+      return;
+   if (sCensusActive)   // re-entrancy guard: never nest census collects
+      return;
+
+   for(int i=0;i<GC_CENSUS_SLOTS;i++)
+   {
+      sgCensus[i].cls = 0;
+      sgCensus[i].count = 0;
+      sgCensus[i].bytes = 0;
+   }
+   sCensusOverflow = 0;
+   sCensusNoClassCount = 0;
+   sCensusNoClassBytes = 0;
+   sCensusRawCount = 0;
+   sCensusRawBytes = 0;
+
+   sCensusActive = 1;
+   __hxcpp_collect(false);
+   sCensusActive = 0;
+
+   GcCensusSlot live[GC_CENSUS_SLOTS];
+   int n = 0;
+   int totalBytes = 0, totalCount = 0;
+   for(int i=0;i<GC_CENSUS_SLOTS;i++)
+   {
+      if (sgCensus[i].cls && sgCensus[i].count)
+      {
+         live[n++] = sgCensus[i];
+         totalBytes += sgCensus[i].bytes;
+         totalCount += sgCensus[i].count;
+      }
+   }
+
+   // Sort by approximate bytes, biggest first (insertion sort, n is small).
+   for(int i=1;i<n;i++)
+   {
+      GcCensusSlot key = live[i];
+      int j = i - 1;
+      while(j >= 0 && live[j].bytes < key.bytes)
+      {
+         live[j+1] = live[j];
+         j--;
+      }
+      live[j+1] = key;
+   }
+
+   FILE *f = fopen("gc_census.log","a");
+   if (!f)
+      return;
+   fprintf(f,"census classes=%d objects=%d approxBytes=%d noClass=%d/%d overflow=%d\n",
+      n, totalCount, totalBytes, sCensusNoClassCount, sCensusNoClassBytes, sCensusOverflow);
+   fprintf(f,"raw-allocs count=%d approxBytes=%d (string buffers etc, non-container)\n",
+      sCensusRawCount, sCensusRawBytes);
+   int maxRows = n < 30 ? n : 30;
+   for(int i=0;i<maxRows;i++)
+   {
+      hx::Class_obj *co = (hx::Class_obj*)live[i].cls;
+      char nameBuf[160];
+      nameBuf[0] = 0;
+      if (co && co->mName.__s && co->mName.length > 0)
+         snprintf(nameBuf, sizeof(nameBuf), "%s", co->mName.utf8_str());
+      else
+         snprintf(nameBuf, sizeof(nameBuf), "(no name)");
+      fprintf(f,"  %-44s objects=%-9d bytes=%d\n", nameBuf, live[i].count, live[i].bytes);
+   }
+   fclose(f);
+}
 
 void __hxcpp_spam_collects(int inEveryNCalls)
 {
