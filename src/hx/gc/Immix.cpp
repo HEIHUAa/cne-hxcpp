@@ -609,6 +609,17 @@ extern void scriptMarkStack(hx::MarkContext *);
    #define HX_GC_CPU_PAUSE()       ((void)0)
 #endif
 
+// Trailing-zero count for the reclaim bit scan.  Falls back to a plain loop
+// on targets without a bit-scan instruction; MSVC/GCC/Clang all covered.
+#if defined(_MSC_VER)
+   inline unsigned int hx_gc_ctz(unsigned int inValue)
+   {
+      unsigned long bit; _BitScanForward(&bit, inValue); return (unsigned int)bit;
+   }
+#elif defined(__GNUC__) || defined(__clang__)
+   inline unsigned int hx_gc_ctz(unsigned int inValue) { return (unsigned int)__builtin_ctz(inValue); }
+#endif
+
 
 // ---  Internal GC - IMMIX Implementation ------------------------------
 
@@ -1218,6 +1229,23 @@ struct BlockDataInfo
                         } \
                      }
 
+                     // ctz walk: only visit set bits instead of all 32
+                     // positions.  `remaining` shadows `starts` - dead bits are
+                     // cleared from both, live bits just leave the walk.
+                     #if defined(_MSC_VER) || defined(__GNUC__) || defined(__clang__)
+                     unsigned int remaining = starts;
+                     while(remaining)
+                     {
+                        unsigned int i = hx_gc_ctz(remaining);
+                        unsigned int mask = 1u<<i;
+                        remaining &= ~mask;
+                        unsigned int header = headerPtr[i];
+                        if ( (header & IMMIX_ALLOC_MARK_ID) != hx::gMarkID )
+                           starts ^= mask;
+                        else
+                           usedBytes += sizeof(int) + ((header & IMMIX_ALLOC_SIZE_MASK) >> IMMIX_ALLOC_SIZE_SHIFT);
+                     }
+                     #else
                      if (starts & 0x000000ff)
                         for(int i=0;i<8;i++)
                            CHECK_FLAG(i,0x000000ff);
@@ -1233,6 +1261,7 @@ struct BlockDataInfo
                      if (starts & 0xff000000)
                         for(int i=24;i<32;i++)
                            CHECK_FLAG(i,0xff000000);
+                     #endif
                   }
                }
                r++;
@@ -1704,11 +1733,13 @@ struct GlobalChunks
       _hx_atomic_add(&sThreadChunkPushCount, 1);
       #endif
 
-      // Wake check runs unconditionally (a stale sLazyThreads here would miss
-      // a thread that just completed, orphaning this job - see the final
-      // processList re-check in popJobOrFinish).  Waking when nobody sleeps
-      // is a cheap no-op: SignalThreadPool only notifies sleepers.
-      if (MAX_GC_THREADS>1)
+      // Wake check: only lock when some thread is actually sleeping.  The
+      // unconditional lock (which guarded against a theoretical job-orphaning
+      // race inherited from the incremental-GC investigation) costs 8-12% of
+      // drain on stock STW marking, where sLazyThreads is false for the whole
+      // parallel phase.  The last-chance processList re-check in
+      // popJobOrFinish stays as the safety net.
+      if (MAX_GC_THREADS>1 && sLazyThreads)
       {
          std::lock_guard<std::mutex> l(sThreadPoolLock);
 
@@ -2125,7 +2156,9 @@ public:
              hx::Object *obj = marking->pop();
              if (obj)
              {
+                #ifdef HXCPP_GC_PERF
                 _hx_atomic_add(&sgMarkCalls, 1);
+                #endif
                 obj->__Mark(this);
                 #ifdef HX_MULTI_THREAD_MARKING
                 // Load balance
@@ -2436,7 +2469,9 @@ void MarkObjectArray(hx::Object **inPtr, int inLength, hx::MarkContext *__inCtx)
 {
    hx::Object *tmp;
 
+   #ifdef HXCPP_GC_PERF
    _hx_atomic_add(&sgArrayMarkCount, inLength);
+   #endif
 
    int extra = inLength & 0x0f;
    for(int i=0;i<extra;i++)

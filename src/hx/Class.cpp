@@ -12,6 +12,11 @@ namespace hx
 typedef std::map<String,Class> ClassMap;
 static ClassMap *sClassMap = 0;
 
+// Snapshot of markable classes: avoids walking the sClassMap red-black tree
+// on every collect.  Rebuilt lazily whenever a class is (re)registered.
+static hx::QuickVec<Class> sMarkableClasses;
+static bool sMarkableClassesDirty = true;
+
 Class _hx_RegisterClass(const String &inClassName, CanCastFunc inCanCast,
                     String inStatics[], String inMembers[],
                     ConstructEmptyFunc inConstructEmpty, ConstructArgsFunc inConstructArgs,
@@ -42,6 +47,7 @@ Class _hx_RegisterClass(const String &inClassName, CanCastFunc inCanCast,
                                   );
    Class c(obj);
    (*sClassMap)[inClassName] = c;
+   sMarkableClassesDirty = true;
    return c;
 }
 
@@ -50,6 +56,7 @@ void _hx_RegisterClass(const String &inClassName, Class inClass)
    if (sClassMap==0)
       sClassMap = new ClassMap;
    (*sClassMap)[inClassName] = inClass;
+   sMarkableClassesDirty = true;
 }
 
 
@@ -120,6 +127,7 @@ void Class_obj::registerScriptable(bool inOverwrite)
    if (!inOverwrite && sClassMap->find(mName)!=sClassMap->end())
       return;
    (*sClassMap)[ mName ] = this;
+   sMarkableClassesDirty = true;
 }
 
 Class Class_obj::GetSuper()
@@ -318,6 +326,25 @@ void MarkClassStatics(hx::MarkContext *__inCtx)
    #ifdef HXCPP_DEBUG
    MarkPushClass("MarkClassStatics",__inCtx);
    #endif
+   #ifndef HXCPP_DEBUG
+   // Release: linear walk of a lazily-rebuilt snapshot (class registration is
+   // rare, so the snapshot is stable across collects).  Only runs on the
+   // collector thread (STW), so no locking is needed against registration.
+   if (sMarkableClassesDirty)
+   {
+      sMarkableClasses.clear();
+      ClassMap::iterator end2 = sClassMap->end();
+      for(ClassMap::iterator i = sClassMap->begin(); i!=end2; ++i)
+      {
+         Class c = i->second;
+         if (c->__meta__.mPtr || c->mMarkFunc)
+            sMarkableClasses.push(c);
+      }
+      sMarkableClassesDirty = false;
+   }
+   for(int i=0;i<sMarkableClasses.size();i++)
+      sMarkableClasses[i]->MarkStatics(__inCtx);
+   #else
    ClassMap::iterator end = sClassMap->end();
    for(ClassMap::iterator i = sClassMap->begin(); i!=end; ++i)
    {
@@ -336,6 +363,7 @@ void MarkClassStatics(hx::MarkContext *__inCtx)
          #endif
       }
    }
+   #endif  // closes #ifndef HXCPP_DEBUG above
    #ifdef HXCPP_DEBUG
    MarkPopClass(__inCtx);
    #endif

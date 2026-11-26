@@ -362,7 +362,9 @@ enum
 
 struct MarkChunk
 {
-   enum { SIZE = 62 };
+   // 248: 4x the original 62 - fewer global-queue handoffs during parallel
+   // marking (each handoff is a CAS pop + possible wake check).
+   enum { SIZE = 248 };
    enum { OBJ_ARRAY_JOB = -1 };
 
    inline MarkChunk() : count(0), next(0) { }
