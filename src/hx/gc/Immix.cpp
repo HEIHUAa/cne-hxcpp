@@ -350,6 +350,11 @@ static bool sGcVerifyGenerational = false;
   enum { MAX_GC_THREADS = 1 };
 #endif
 
+// Instrumentation: total objects pushed through MarkObjectArray per collect.
+static volatile int sgArrayMarkCount = 0;
+// Instrumentation: number of __Mark virtual calls issued while draining.
+static volatile int sgMarkCalls = 0;
+
 #ifdef PROFILE_THREAD_USAGE
 static int sThreadMarkCountData[MAX_GC_THREADS+1];
 static int sThreadArrayMarkCountData[MAX_GC_THREADS+1];
@@ -587,6 +592,21 @@ extern void scriptMarkStack(hx::MarkContext *);
 #define ZERO_MEM(ptr, n) ZeroMemory(ptr,n)
 #else
 #define ZERO_MEM(ptr, n) memset(ptr,0,n)
+#endif
+
+// Software prefetch / spin pause hints.  Both are pure hints: on a target
+// without the instruction the compiler emits a nop (or nothing), so no
+// runtime CPUID gate is required and older CPUs keep running unchanged.
+#if defined(_MSC_VER) && (defined(_M_IX86) || defined(_M_X64))
+   #include <intrin.h>
+   #define HX_GC_PREFETCH_READ(p)  _mm_prefetch((const char *)(p), _MM_HINT_T0)
+   #define HX_GC_CPU_PAUSE()       _mm_pause()
+#elif (defined(__i386__) || defined(__x86_64__)) && (defined(__GNUC__) || defined(__clang__))
+   #define HX_GC_PREFETCH_READ(p)  __builtin_prefetch((const void *)(p), 0, 1)
+   #define HX_GC_CPU_PAUSE()       __builtin_ia32_pause()
+#else
+   #define HX_GC_PREFETCH_READ(p)  ((void)0)
+   #define HX_GC_CPU_PAUSE()       ((void)0)
 #endif
 
 
@@ -1855,6 +1875,7 @@ struct GlobalChunks
          {
             for(int spinCount = 0; spinCount<10000; spinCount++)
             {
+               HX_GC_CPU_PAUSE(); // hint only: nop on CPUs without PAUSE
                if ( sgThreadPoolAbort || sAllThreads == (1<<inThreadId) )
                   break;
                if (processList)
@@ -2104,6 +2125,7 @@ public:
              hx::Object *obj = marking->pop();
              if (obj)
              {
+                _hx_atomic_add(&sgMarkCalls, 1);
                 obj->__Mark(this);
                 #ifdef HX_MULTI_THREAD_MARKING
                 // Load balance
@@ -2232,15 +2254,13 @@ void MarkAllocUnchecked(void *inPtr,hx::MarkContext *__inCtx)
 
          unsigned int startFlag = gImmixStartFlag[start&127];
          unsigned int *pos = info->allocStart + startRow;
-         // Most markings hit a slot that is already recorded; skipping the
-         // atomic here removes the cache-line contention between the marker
-         // threads, which is what the parallel phase spends its time on.
+         // Fast path: most markings hit a slot already recorded, so skip the
+         // atomic entirely (avoids cache-line contention between marker threads).
+         // Slow path: OR is idempotent, so a single atomic OR is equivalent to
+         // the CAS retry loop but never spins when several threads set bits in
+         // the same 32-bit word.
          if (!(*pos & startFlag))
-         {
-            unsigned int val = *pos;
-            while(_hx_atomic_compare_exchange((volatile int *)pos, val,val|startFlag) != val)
-               val = *pos;
-         }
+            _hx_atomic_or((volatile int *)pos, startFlag);
 
          #ifdef HXCPP_GC_GENERATIONAL
          info->mHasSurvivor = true;
@@ -2324,15 +2344,13 @@ void MarkObjectAllocUnchecked(hx::Object *inPtr,hx::MarkContext *__inCtx)
 
       unsigned int startFlag = gImmixStartFlag[start&127];
       unsigned int *pos = info->allocStart + startRow;
-      // Most markings hit a slot that is already recorded; skipping the
-      // atomic here removes the cache-line contention between the marker
-      // threads, which is what the parallel phase spends its time on.
+      // Fast path: most markings hit a slot already recorded, so skip the
+      // atomic entirely (avoids cache-line contention between marker threads).
+      // Slow path: OR is idempotent, so a single atomic OR is equivalent to
+      // the CAS retry loop but never spins when several threads set bits in
+      // the same 32-bit word.
       if (!(*pos & startFlag))
-      {
-         unsigned int val = *pos;
-         while(_hx_atomic_compare_exchange( (volatile int *)pos, val, val|startFlag) != val)
-            val = *pos;
-      }
+         _hx_atomic_or((volatile int *)pos, startFlag);
       #ifdef HXCPP_GC_GENERATIONAL
       info->mHasSurvivor = true;
       #endif
@@ -2417,6 +2435,8 @@ void MarkObjectAllocUnchecked(hx::Object *inPtr,hx::MarkContext *__inCtx)
 void MarkObjectArray(hx::Object **inPtr, int inLength, hx::MarkContext *__inCtx)
 {
    hx::Object *tmp;
+
+   _hx_atomic_add(&sgArrayMarkCount, inLength);
 
    int extra = inLength & 0x0f;
    for(int i=0;i<extra;i++)
@@ -4616,8 +4636,11 @@ public:
          {
             spinCount++;
             if (spinCount<10000)
+            {
+               HX_GC_CPU_PAUSE(); // hint only: nop on CPUs without PAUSE
                // Spin
                continue;
+            }
             // Full for now, so sleep...
             return true;
          }
@@ -4883,6 +4906,12 @@ public:
    double tMarked;
    void MarkAll(bool inGenerational)
    {
+      // Fine-grained mark breakdown for perf tuning (GCPerfLog -> gc_perf.log).
+      // __hxcpp_time_stamp() is a cheap monotonic clock; the stamps themselves
+      // are only read when a log line is emitted, so overhead is negligible.
+      double mT0 = __hxcpp_time_stamp();
+      double mT1 = mT0, mT2 = mT0, mT3 = mT0, mT4 = mT0, mT5 = mT0, mT6 = mT0, mT7 = mT0;
+
       if (!inGenerational)
       {
          hx::gPrevByteMarkID = hx::gByteMarkID;
@@ -4924,6 +4953,7 @@ public:
       }
 
       MEM_STAMP(tMarkInit);
+      mT1 = __hxcpp_time_stamp(); // init: mark-id switch + ClearRowMarks
 
       #ifdef PROFILE_THREAD_USAGE
       for(int i=-1;i<MAX_GC_THREADS;i++)
@@ -4935,15 +4965,31 @@ public:
       mMarker.init();
 
       hx::MarkClassStatics(&mMarker);
+      mT2 = __hxcpp_time_stamp(); // class statics
 
       {
       hx::AutoMarkPush info(&mMarker,"Roots","root");
 
-      for(hx::RootSet::iterator i = hx::sgRootSet.begin(); i!=hx::sgRootSet.end(); ++i)
+      // Software prefetch the object headers a few roots ahead: this loop is
+      // the single largest cost of a collection (pointer chasing over every
+      // global root).  Prefetch is a hint, so it is a no-op on CPUs without it.
       {
-         hx::Object *&obj = **i;
-         if (obj)
-            hx::MarkObjectAlloc(obj , &mMarker );
+         hx::RootSet::iterator ahead = hx::sgRootSet.begin();
+         for(int pf=0; pf<4 && ahead!=hx::sgRootSet.end(); pf++) ++ahead;
+
+         for(hx::RootSet::iterator i = hx::sgRootSet.begin(); i!=hx::sgRootSet.end(); ++i)
+         {
+            if (ahead!=hx::sgRootSet.end())
+            {
+               if (hx::Object *next = **ahead)
+                  HX_GC_PREFETCH_READ((const char *)next - sizeof(int)); // header + mark byte
+               ++ahead;
+            }
+
+            hx::Object *&obj = **i;
+            if (obj)
+               hx::MarkObjectAlloc(obj , &mMarker );
+         }
       }
 
       if (hx::sgOffsetRootSet)
@@ -4957,6 +5003,7 @@ public:
                hx::MarkObjectAlloc(obj , &mMarker );
          }
       } // automark
+      mT3 = __hxcpp_time_stamp(); // roots (sgRootSet + offset roots, includes prefetch)
 
       #ifdef PROFILE_COLLECT
       hx::rootObjects = sObjectMarks;
@@ -4970,6 +5017,7 @@ public:
       for(int i=0;i<hx::sZombieList.size();i++)
          hx::MarkObjectAlloc(hx::sZombieList[i] , &mMarker );
       } // automark
+      mT4 = __hxcpp_time_stamp(); // zombies
 
       MEM_STAMP(tMarkLocal);
       hx::localCount = 0;
@@ -4986,6 +5034,7 @@ public:
       #endif
 
       MEM_STAMP(tMarkLocalEnd);
+      mT5 = __hxcpp_time_stamp(); // local stacks
 
       #ifdef HX_MULTI_THREAD_MARKING
          mMarker.releaseJobs();
@@ -4999,6 +5048,7 @@ public:
 
 
       MEM_STAMP(tMarked);
+      mT6 = __hxcpp_time_stamp(); // parallel/serial mark stack drain
 
       hx::FindZombies(mMarker);
 
@@ -5029,6 +5079,19 @@ public:
       while(markedWeakValue);
 
       hx::RunFinalizers();
+
+      mT7 = __hxcpp_time_stamp(); // FindZombies + weak hashes + finalizers
+      {
+         int rootsN = (int)hx::sgRootSet.size() + (hx::sgOffsetRootSet ? (int)hx::sgOffsetRootSet->size() : 0);
+         int arrayN = (int)sgArrayMarkCount;
+         int markCalls = (int)sgMarkCalls;
+         sgArrayMarkCount = 0;
+         sgMarkCalls = 0;
+         GCPerfLog("marksplit init=%.3f statics=%.3f roots=%.3f zombies=%.3f locals=%.3f drain=%.3f weakfin=%.3f total=%.3f rootsN=%d stacks=%d arrayN=%d markCalls=%d",
+            (mT1-mT0)*1000, (mT2-mT1)*1000, (mT3-mT2)*1000, (mT4-mT3)*1000,
+            (mT5-mT4)*1000, (mT6-mT5)*1000, (mT7-mT6)*1000, (mT7-mT0)*1000,
+            rootsN, (int)mLocalAllocs.size(), arrayN, markCalls);
+      }
 
       #ifdef HXCPP_GC_VERIFY
       for(int i=0;i<mAllBlocks.size();i++)
