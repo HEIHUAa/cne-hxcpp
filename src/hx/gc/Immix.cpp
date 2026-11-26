@@ -5944,6 +5944,46 @@ public:
       return mLargeAllocated + (mRowsInUse<<IMMIX_LINE_BITS);
    }
 
+   // Large-pool attribution for the census: walk the retained blobs (they
+   // have no class - these are byte stores, big strings, audio PCM) and dump
+   // a size histogram plus the biggest single blobs.  blob[0] is the size
+   // header AllocLarge writes.
+   void CensusLargePool(FILE *f)
+   {
+      size_t largeCount = 0, largeTotal = 0;
+      int hist[5] = {0,0,0,0,0}; // <64KB, <256KB, <1MB, <4MB, >=4MB
+      size_t topSize[6] = {0,0,0,0,0,0};
+      mLargeListLock.lock();
+      int n = mLargeList.size();
+      for(int i=0;i<n;i++)
+      {
+         unsigned int *blob = mLargeList[i];
+         size_t sz = blob[0];
+         largeCount++;
+         largeTotal += sz;
+         int bucket = sz<65536 ? 0 : sz<262144 ? 1 : sz<1048576 ? 2 : sz<4194304 ? 3 : 4;
+         hist[bucket]++;
+         for(int t=0;t<6;t++)
+         {
+            if (sz > topSize[t])
+            {
+               for(int s=5;s>t;s--)
+                  topSize[s] = topSize[s-1];
+               topSize[t] = sz;
+               break;
+            }
+         }
+      }
+      mLargeListLock.unlock();
+      fprintf(f,"large-pool blobs=%d bytes=%d hist <64KB=%d 64K-256K=%d 256K-1M=%d 1M-4M=%d >4M=%d\n",
+         (int)largeCount, (int)largeTotal, hist[0], hist[1], hist[2], hist[3], hist[4]);
+      fprintf(f,"large-pool top blob sizes (MB):");
+      for(int t=0;t<6;t++)
+         if (topSize[t] > 0)
+            fprintf(f," %.1f", topSize[t]/1048576.0);
+      fprintf(f,"\n");
+   }
+
    bool IsAllBlock(BlockData *block)
    {
       if (mAllBlocks.size())
@@ -7414,6 +7454,7 @@ void __hxcpp_gc_census_dump()
       n, totalCount, totalBytes, sCensusNoClassCount, sCensusNoClassBytes, sCensusOverflow);
    fprintf(f,"raw-allocs count=%d approxBytes=%d (string buffers etc, non-container)\n",
       sCensusRawCount, sCensusRawBytes);
+   sGlobalAlloc->CensusLargePool(f);
    int maxRows = n < 30 ? n : 30;
    for(int i=0;i<maxRows;i++)
    {
