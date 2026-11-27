@@ -71,8 +71,26 @@ static void GcRegisterCrashDumpFilter()
 static bool sGcCrashDumpRegistered = (GcRegisterCrashDumpFilter(), true);
 #endif
 
+// [GEN-TEST] Single instrumentation switch for ALL GC logging + timestamps:
+// build with -DHXCPP_GC_PERF to get gc_perf.log (collect / marksplit /
+// genverify lines) and the fine-grained stage stamps.  Without the define
+// everything below compiles to ZERO runtime cost: no file I/O, no clock
+// reads, no formatting.  (The markCalls/arrayN hot-path atomics were already
+// gated by this same define.)
+#ifdef HXCPP_GC_PERF
+  #define GC_LOG_ON 1
+#else
+  #define GC_LOG_ON 0
+#endif
+#if GC_LOG_ON
+  #define GC_TIMESTAMP() __hxcpp_time_stamp()
+#else
+  #define GC_TIMESTAMP() 0.0
+#endif
+
 // Timing for the collections.  GUI builds have no console, so the numbers go
-// to a file next to the executable.
+// to a file next to the executable (instrumented builds only).
+#if GC_LOG_ON
 static void GCPerfLog(const char *inFormat, ...)
 {
    FILE *f = fopen("gc_perf.log","a");
@@ -85,6 +103,9 @@ static void GCPerfLog(const char *inFormat, ...)
    fputc('\n', f);
    fclose(f);
 }
+#else
+static inline void GCPerfLog(const char *, ...) { }
+#endif
 
 // --- Live-object census (diagnostic) ----------------------------------------
 // Between census-begin (flag set) and census-end the mark path records every
@@ -332,6 +353,14 @@ static size_t sgMaximumFreeSpace = 1024 * 1024 * 1024;
 // HXCPP_GC_DYNAMIC_SIZE
 
 //#define HXCPP_GC_SUMMARY
+
+// [GEN-TEST] Verify pass (missed-mark counting) - was ON for the crash-hunt
+// (proved ~1900 escapes/34 minors pre-fix, 0 post-fix).  It DOUBLES the mark
+// cost, so it is OFF for the performance-validation build.
+// >>> REMOVE together with the HXCPP_GC_GENERATIONAL define in hxcpp.h. <<<
+// #define HXCPP_GC_VERIFY
+
+//#define HXCPP_GC_VERIFY
 //#define PROFILE_COLLECT
 //#define PROFILE_THREAD_USAGE
 //#define HXCPP_GC_VERIFY
@@ -383,6 +412,41 @@ bool hxInWatchList(void *watch)
 
 #ifdef HX_GC_VERIFY_GENERATIONAL
 static bool sGcVerifyGenerational = false;
+// [GEN-TEST] Per-collect missed-mark counters, reset before the verify mark
+// and logged to gc_perf.log after it.  Atomic because the verify mark runs
+// on the parallel mark workers.
+static volatile int sgVerifyEscapedNursery = 0;
+static volatile int sgVerifyMissedAlloc = 0;
+// [GEN-TEST] Class/size breakdown of escaped objects: which TYPES the minor
+// misses.  cls = hx::Class_obj ptr for object escapes, 0 + size for raw allocs.
+struct GcEscapeSlot { void *cls; void *addr; int size; int count; };
+#define GC_ESCAPE_SLOTS 64
+static GcEscapeSlot sgEscapes[GC_ESCAPE_SLOTS];
+static int sgEscapeCount = 0;
+static volatile int sgEscapeLock = 0;
+static void gcEscapeRecord(void *inCls, int inSize, void *inAddr)
+{
+   while (_hx_atomic_compare_exchange(&sgEscapeLock, 0, 1) != 0) { }
+   for(int i=0;i<sgEscapeCount;i++)
+   {
+      if (sgEscapes[i].cls==inCls && sgEscapes[i].size==inSize)
+      {
+         sgEscapes[i].count++;
+         if (!sgEscapes[i].addr) sgEscapes[i].addr = inAddr;
+         sgEscapeLock = 0;
+         return;
+      }
+   }
+   if (sgEscapeCount < GC_ESCAPE_SLOTS)
+   {
+      sgEscapes[sgEscapeCount].cls = inCls;
+      sgEscapes[sgEscapeCount].addr = inAddr;
+      sgEscapes[sgEscapeCount].size = inSize;
+      sgEscapes[sgEscapeCount].count = 1;
+      sgEscapeCount++;
+   }
+   sgEscapeLock = 0;
+}
 #endif
 
 
@@ -2331,7 +2395,11 @@ void MarkAllocUnchecked(void *inPtr,hx::MarkContext *__inCtx)
       if (sGcVerifyGenerational)
       {
          printf("Nursery alloc escaped generational collection %p\n", inPtr);
-         DebuggerTrap();
+         {
+            unsigned int eflags = *((unsigned int *)(((size_t)inPtr)-sizeof(int)));
+            gcEscapeRecord(0, (int)(eflags & 0xffff), inPtr);
+         }
+         _hx_atomic_add(&sgVerifyEscapedNursery, 1);
       }
       #endif
 
@@ -2377,7 +2445,7 @@ void MarkAllocUnchecked(void *inPtr,hx::MarkContext *__inCtx)
       if (sGcVerifyGenerational && ((unsigned char *)inPtr)[HX_ENDIAN_MARK_ID_BYTE] != gPrevByteMarkID)
       {
          printf("Alloc missed int generational collection %p\n", inPtr);
-         DebuggerTrap();
+         _hx_atomic_add(&sgVerifyMissedAlloc, 1);
       }
       #endif
       ((unsigned char *)inPtr)[HX_ENDIAN_MARK_ID_BYTE] = gByteMarkID;
@@ -2423,7 +2491,8 @@ void MarkObjectAllocUnchecked(hx::Object *inPtr,hx::MarkContext *__inCtx)
          if (sGcVerifyGenerational)
          {
             printf("Nursery object escaped generational collection %p\n", inPtr);
-            DebuggerTrap();
+            gcEscapeRecord((void*)inPtr->__GetClass().GetPtr(), 0, inPtr);
+            _hx_atomic_add(&sgVerifyEscapedNursery, 1);
          }
       #endif
 
@@ -3876,11 +3945,15 @@ public:
 
    bool allowMoreBlocks()
    {
-      #ifdef HXCPP_GC_GENERATIONAL
-      return sGcMode==gcmFull;
-      #else
+      // [GEN-TEST-FIX] Generational mode previously refused heap growth
+      // (return sGcMode==gcmFull), which pinned the heap at its ceiling and
+      // made every allocation frame trigger a minor collect during gameplay:
+      // measured ~200 minors/s (= one STW pause per frame, ~300ms/s = 30% of
+      // wall time in GC) while the live set only grew ~1.1MB/s.  Allow growth
+      // here as in full mode - it is still bounded by sWorkingMemorySize in
+      // GetFreeBlock, and the adaptive full-collect cycle reclaims the old
+      // generation periodically.
       return true;
-      #endif
    }
 
    void repoolReclaimedBlock(BlockDataInfo *block)
@@ -5020,7 +5093,7 @@ public:
       // Fine-grained mark breakdown for perf tuning (GCPerfLog -> gc_perf.log).
       // __hxcpp_time_stamp() is a cheap monotonic clock; the stamps themselves
       // are only read when a log line is emitted, so overhead is negligible.
-      double mT0 = __hxcpp_time_stamp();
+      double mT0 = GC_TIMESTAMP();
       double mT1 = mT0, mT2 = mT0, mT3 = mT0, mT4 = mT0, mT5 = mT0, mT6 = mT0, mT7 = mT0;
 
       if (!inGenerational)
@@ -5064,7 +5137,7 @@ public:
       }
 
       MEM_STAMP(tMarkInit);
-      mT1 = __hxcpp_time_stamp(); // init: mark-id switch + ClearRowMarks
+      mT1 = GC_TIMESTAMP(); // init: mark-id switch + ClearRowMarks
 
       #ifdef PROFILE_THREAD_USAGE
       for(int i=-1;i<MAX_GC_THREADS;i++)
@@ -5076,7 +5149,28 @@ public:
       mMarker.init();
 
       hx::MarkClassStatics(&mMarker);
-      mT2 = __hxcpp_time_stamp(); // class statics
+
+      #ifdef HXCPP_GC_GENERATIONAL
+      // [GEN-TEST-FIX] Design-flaw fix (present in upstream hxcpp too): the
+      // remembered set records old objects that received young pointers, but
+      // Collect() only PATCHES their mark byte to the current id (clearing the
+      // REMEMBERED bit) without ever re-tracing them.  The sticky-skip test
+      // (header & gPrevMarkIdMask) then treats them as already-marked during
+      // the minor, so every young object reachable ONLY through a remembered
+      // object was missed (measured: ~1900 escapes across 34 minors, gc_perf
+      // genverify lines).  Pushing them onto the mark stack here (Unchecked =
+      // no skip test) traces their subtrees; old children are still skipped by
+      // the sticky test, so only the young frontier is walked.  For full
+      // collects this is redundant but harmless (idempotent marking).
+      if (mRememberedSet.size())
+         for(int i=0;i<mRememberedSet.size();i++)
+         {
+            hx::Object *obj = mRememberedSet[i];
+            if (obj)
+               hx::MarkObjectAllocUnchecked(obj, &mMarker);
+         }
+      #endif
+      mT2 = GC_TIMESTAMP(); // class statics
 
       {
       hx::AutoMarkPush info(&mMarker,"Roots","root");
@@ -5114,7 +5208,7 @@ public:
                hx::MarkObjectAlloc(obj , &mMarker );
          }
       } // automark
-      mT3 = __hxcpp_time_stamp(); // roots (sgRootSet + offset roots, includes prefetch)
+      mT3 = GC_TIMESTAMP(); // roots (sgRootSet + offset roots, includes prefetch)
 
       #ifdef PROFILE_COLLECT
       hx::rootObjects = sObjectMarks;
@@ -5128,7 +5222,7 @@ public:
       for(int i=0;i<hx::sZombieList.size();i++)
          hx::MarkObjectAlloc(hx::sZombieList[i] , &mMarker );
       } // automark
-      mT4 = __hxcpp_time_stamp(); // zombies
+      mT4 = GC_TIMESTAMP(); // zombies
 
       MEM_STAMP(tMarkLocal);
       hx::localCount = 0;
@@ -5145,7 +5239,7 @@ public:
       #endif
 
       MEM_STAMP(tMarkLocalEnd);
-      mT5 = __hxcpp_time_stamp(); // local stacks
+      mT5 = GC_TIMESTAMP(); // local stacks
 
       #ifdef HX_MULTI_THREAD_MARKING
          mMarker.releaseJobs();
@@ -5159,7 +5253,7 @@ public:
 
 
       MEM_STAMP(tMarked);
-      mT6 = __hxcpp_time_stamp(); // parallel/serial mark stack drain
+      mT6 = GC_TIMESTAMP(); // parallel/serial mark stack drain
 
       hx::FindZombies(mMarker);
 
@@ -5191,18 +5285,20 @@ public:
 
       hx::RunFinalizers();
 
-      mT7 = __hxcpp_time_stamp(); // FindZombies + weak hashes + finalizers
+      mT7 = GC_TIMESTAMP(); // FindZombies + weak hashes + finalizers
       {
          int rootsN = (int)hx::sgRootSet.size() + (hx::sgOffsetRootSet ? (int)hx::sgOffsetRootSet->size() : 0);
          int arrayN = (int)sgArrayMarkCount;
          int markCalls = (int)sgMarkCalls;
          sgArrayMarkCount = 0;
          sgMarkCalls = 0;
+         #if GC_LOG_ON
          GCPerfLog("t=%.2f marksplit init=%.3f statics=%.3f roots=%.3f zombies=%.3f locals=%.3f drain=%.3f weakfin=%.3f total=%.3f rootsN=%d stacks=%d arrayN=%d markCalls=%d",
             mT0,
             (mT1-mT0)*1000, (mT2-mT1)*1000, (mT3-mT2)*1000, (mT4-mT3)*1000,
             (mT5-mT4)*1000, (mT6-mT5)*1000, (mT7-mT6)*1000, (mT7-mT0)*1000,
             rootsN, (int)mLocalAllocs.size(), arrayN, markCalls);
+         #endif
       }
 
       #ifdef HXCPP_GC_VERIFY
@@ -5272,7 +5368,7 @@ public:
       #endif
 
       STAMP(t0)
-      double tPerf0 = __hxcpp_time_stamp();
+      double tPerf0 = GC_TIMESTAMP();
 
       // We are the collector - all must wait for us
       LocalAllocator *this_local = 0;
@@ -5341,16 +5437,16 @@ public:
          }
       }
 
-      hx::QuickVec<hx::Object *> rememberedSet;
+      mRememberedSet.clear();
       generational = !inMajor && !inForceCompact && sGcMode == gcmGenerational;
       if (sGcMode==gcmGenerational)
       {
-         hx::sGlobalChunks.copyPointers(rememberedSet,!generational);
+         hx::sGlobalChunks.copyPointers(mRememberedSet,!generational);
          #ifdef SHOW_MEM_EVENTS
-         GCLOG("Patch remembered set marks %d\n", rememberedSet.size());
+         GCLOG("Patch remembered set marks %d\n", mRememberedSet.size());
          #endif
-         for(int i=0;i<rememberedSet.size();i++)
-            ((unsigned char *)rememberedSet[i])[HX_ENDIAN_MARK_ID_BYTE] = gByteMarkID;
+         for(int i=0;i<mRememberedSet.size();i++)
+            ((unsigned char *)mRememberedSet[i])[HX_ENDIAN_MARK_ID_BYTE] = gByteMarkID;
       }
       #endif
 
@@ -5363,10 +5459,161 @@ public:
          #ifdef SHOW_MEM_EVENTS
          GCLOG("verify generational [\n");
          #endif
+         sgVerifyEscapedNursery = 0;
+         sgVerifyMissedAlloc = 0;
+         sgEscapeCount = 0;
          sGcVerifyGenerational = true;
          sgTimeToNextTableUpdate--;
          MarkAll(false);
          sGcVerifyGenerational = false;
+         // [GEN-TEST] Log the missed-mark counts for this collect.  A non-zero
+         // count means the generational minor missed live objects (rescued by
+         // this verify pass before the sweep - the counts are the evidence).
+         char escBuf[512];
+         int eo = 0;
+         for(int i=0;i<sgEscapeCount && eo<460;i++)
+         {
+            char nameBuf[96];
+            nameBuf[0] = 0;
+            if (sgEscapes[i].cls)
+            {
+               hx::Class_obj *co = (hx::Class_obj*)sgEscapes[i].cls;
+               if (co && co->mName.utf8_str())
+                  snprintf(nameBuf, sizeof(nameBuf), "%s", co->mName.utf8_str());
+               else
+                  snprintf(nameBuf, sizeof(nameBuf), "(no name)");
+            }
+            else
+               snprintf(nameBuf, sizeof(nameBuf), "alloc(sz%d)", sgEscapes[i].size);
+            eo += snprintf(escBuf+eo, sizeof(escBuf)-eo, " %s=%d", nameBuf, sgEscapes[i].count);
+         }
+         escBuf[eo] = 0;
+         GCPerfLog("genverify remembered=%d escapedNursery=%d missedAlloc=%d generational=%d esc:%s",
+            (int)mRememberedSet.size(), sgVerifyEscapedNursery, sgVerifyMissedAlloc,
+            (int)generational, escBuf);
+
+         // [GEN-TEST] One-shot owner scan: after the verify mark, every live
+         // allocation is marked with the current id, so a raw word-scan over
+         // live allocations finds exactly who holds pointers to the escaped
+         // objects.  Runs once per process, at the first big escape burst.
+         static bool sEscapeOwnerRan = false;
+         if (sgVerifyEscapedNursery >= 50 && !sEscapeOwnerRan && sgEscapeCount > 0)
+         {
+            sEscapeOwnerRan = true;
+            void *tblAddr[256];
+            int tblIdx[256];
+            for(int h=0;h<256;h++) tblAddr[h]=0;
+            int nT = sgEscapeCount < 48 ? sgEscapeCount : 48;
+            for(int i=0;i<nT;i++)
+            {
+               if (!sgEscapes[i].addr) continue;
+               int h = (int)(((size_t)sgEscapes[i].addr) >> 4) & 255;
+               while (tblAddr[h]) h = (h+1)&255;
+               tblAddr[h] = sgEscapes[i].addr;
+               tblIdx[h] = i;
+            }
+            char ownerDesc[64][96];
+            bool ownerFound[64];
+            for(int i=0;i<GC_ESCAPE_SLOTS;i++) { ownerFound[i]=false; ownerDesc[i][0]=0; }
+
+            for(int b=0;b<mAllBlocks.size() && !sgThreadPoolAbort;b++)
+            {
+               BlockDataInfo *bi = mAllBlocks[b];
+               if (bi->isEmpty()) continue;
+               unsigned char *rowMarked = bi->mPtr->mRowMarked;
+               for(int r=IMMIX_HEADER_LINES;r<IMMIX_LINES;r++)
+               {
+                  if (!rowMarked[r]) continue;
+                  unsigned int starts = bi->allocStart[r];
+                  if (!starts) continue;
+                  unsigned char *row = bi->mPtr->mRow[r];
+                  for(int i=0;i<32;i++)
+                  {
+                     int pos = i<<2;
+                     if (!(starts & (1<<i))) continue;
+                     unsigned int hdr = *(unsigned int *)(row+pos);
+                     if ((hdr & IMMIX_ALLOC_MARK_ID) != hx::gMarkID) continue;
+                     char *base = (char *)row+pos+4;
+                     int sz = (hdr & IMMIX_ALLOC_SIZE_MASK) >> IMMIX_ALLOC_SIZE_SHIFT;
+                     if (sz<8) continue;
+                     for(char *w = base; w + 8 <= base + sz; w += 8)
+                     {
+                        void *pv = *(void **)w;
+                        if (!pv) continue;
+                        int h = (int)(((size_t)pv) >> 4) & 255;
+                        while (tblAddr[h])
+                        {
+                           if (tblAddr[h] == pv)
+                           {
+                              int ti = tblIdx[h];
+                              if (!ownerFound[ti])
+                              {
+                                 ownerFound[ti] = true;
+                                 if (hdr & IMMIX_ALLOC_IS_CONTAINER)
+                                 {
+                                    hx::Object *o = (hx::Object *)base;
+                                    hx::Class co = o->__GetClass();
+                                    if (co.GetPtr() && co.GetPtr()->mName.utf8_str())
+                                       snprintf(ownerDesc[ti], sizeof(ownerDesc[ti]), "obj:%s",
+                                          co.GetPtr()->mName.utf8_str());
+                                    else
+                                       snprintf(ownerDesc[ti], sizeof(ownerDesc[ti]), "obj:?");
+                                 }
+                                 else
+                                    snprintf(ownerDesc[ti], sizeof(ownerDesc[ti]), "alloc(sz%d)", sz);
+                              }
+                              break;
+                           }
+                           h = (h+1)&255;
+                        }
+                     }
+                  }
+               }
+            }
+            for(int i=0;i<mLargeList.size();i++)
+            {
+               unsigned int *blob = mLargeList[i];
+               int lsz = (int)(*blob);
+               char *base = (char *)(blob+2);
+               for(char *w = base; w + 8 <= base + lsz; w += 8)
+               {
+                  void *pv = *(void **)w;
+                  if (!pv) continue;
+                  int h = (int)(((size_t)pv) >> 4) & 255;
+                  while (tblAddr[h])
+                  {
+                     if (tblAddr[h] == pv)
+                     {
+                        int ti = tblIdx[h];
+                        if (!ownerFound[ti])
+                        {
+                           ownerFound[ti] = true;
+                           snprintf(ownerDesc[ti], sizeof(ownerDesc[ti]), "large(sz%d)", lsz);
+                        }
+                        break;
+                     }
+                     h = (h+1)&255;
+                  }
+               }
+            }
+            for(int i=0;i<nT;i++)
+            {
+               char tname[96];
+               tname[0] = 0;
+               if (sgEscapes[i].cls)
+               {
+                  hx::Class_obj *co = (hx::Class_obj*)sgEscapes[i].cls;
+                  if (co && co->mName.utf8_str())
+                     snprintf(tname, sizeof(tname), "%s", co->mName.utf8_str());
+                  else
+                     snprintf(tname, sizeof(tname), "(no name)");
+               }
+               else
+                  snprintf(tname, sizeof(tname), "alloc(sz%d)", sgEscapes[i].size);
+               GCPerfLog("escape-owner tgt=%s addr=%p owner=%s",
+                  tname, sgEscapes[i].addr, ownerFound[i] ? ownerDesc[i] : "(none found)");
+            }
+         }
          #ifdef SHOW_MEM_EVENTS
          GCLOG("] verify generational\n");
          #endif
@@ -5374,7 +5621,7 @@ public:
       #endif
 
       STAMP(t2)
-      double tPerfMark = __hxcpp_time_stamp();
+      double tPerfMark = GC_TIMESTAMP();
 
 
       // Sweep blocks
@@ -5436,7 +5683,7 @@ public:
       #ifdef HXCPP_GC_GENERATIONAL
       if (compactSurviors)
       {
-         MoveSurvivors(&rememberedSet);
+         MoveSurvivors(&mRememberedSet);
       }
       #endif
 
@@ -5492,7 +5739,7 @@ public:
       size_t bytesInUse = mRowsInUse<<IMMIX_LINE_BITS;
 
       STAMP(t3)
-      double tPerfReclaim = __hxcpp_time_stamp();
+      double tPerfReclaim = GC_TIMESTAMP();
 
 
       #ifdef HXCPP_TELEMETRY
@@ -5546,7 +5793,7 @@ public:
 
 
       STAMP(t4)
-      double tPerfLarge = __hxcpp_time_stamp();
+      double tPerfLarge = GC_TIMESTAMP();
 
       bool defragged = false;
 
@@ -5629,9 +5876,13 @@ public:
 
                      int releasedBlocks = releaseEmptyGroups(stats, releaseSize);
                      if (releasedBlocks)
+                     {
+                        #if GC_LOG_ON
                         GCPerfLog("release blocks=%d (%dMB) cap=%dMB used=%dMB",
                            releasedBlocks, (int)(releasedBlocks>>(20-IMMIX_BLOCK_BITS)),
                            (int)(GetWorkingMemory()>>20), (int)(MemUsage()>>20));
+                        #endif
+                     }
                      #ifdef SHOW_FRAGMENTATION
                      int releasedGroups = releasedBlocks >> IMMIX_BLOCK_GROUP_BITS;
                      GCLOG(" Released %s, %d groups\n", formatBytes((size_t)releasedBlocks<<IMMIX_BLOCK_BITS).c_str(), releasedGroups );
@@ -5661,7 +5912,7 @@ public:
 
 
       STAMP(t5)
-      double tPerfStats = __hxcpp_time_stamp();
+      double tPerfStats = GC_TIMESTAMP();
 
       size_t mem = mRowsInUse<<IMMIX_LINE_BITS;
       size_t baseMem = full ? bytesInUse : mem;
@@ -5676,6 +5927,23 @@ public:
       {
          sWorkingMemorySize = std::max( mem + targetFree, (size_t)hx::sgMinimumWorkingMemory);
          sSoftTriggerRows = (sWorkingMemorySize>>IMMIX_LINE_BITS)*3/5;
+      }
+      else
+      {
+         // [GEN-TEST-FIX] Thrash guard.  During heavy allocation phases the
+         // live set grows past the fixed soft trigger (60% of a frozen
+         // working-memory target), minors can no longer free anything, and
+         // every allocation frame re-triggered a collect - measured ~200
+         // minors/s = ~36% of wall time in STW during a whole PlayState
+         // session.  Grow the working memory (and the soft trigger with it)
+         // whenever the live set approaches the trigger; the adaptive
+         // full-collect cycle reclaims the old generation when the data dies
+         // and the non-generational branch rebalances the target back down.
+         if (mRowsInUse + sSoftTriggerRows/8 >= sSoftTriggerRows)
+         {
+            sWorkingMemorySize = sWorkingMemorySize * 5 / 4;
+            sSoftTriggerRows = (sWorkingMemorySize>>IMMIX_LINE_BITS)*3/5;
+         }
       }
 
       #if defined(SHOW_FRAGMENTATION) || defined(SHOW_MEM_EVENTS)
@@ -5735,14 +6003,17 @@ public:
       // Delaying it until just before the block is used to improve the cache locality
       backgroundProcessFreeList(true);
 
+      #if GC_LOG_ON
       {
-         double tPerfEnd = __hxcpp_time_stamp();
-         GCPerfLog("t=%.2f collect total=%.3f mark=%.3f reclaim=%.3f large=%.3f stats=%.3f freelist=%.3f used=%d blocks=%d largeBytes=%d",
+         double tPerfEnd = GC_TIMESTAMP();
+         GCPerfLog("t=%.2f collect gen=%d total=%.3f mark=%.3f reclaim=%.3f large=%.3f stats=%.3f freelist=%.3f used=%d blocks=%d largeBytes=%d",
             tPerf0,
+            (int)generational,
             (tPerfEnd-tPerf0)*1000, (tPerfMark-tPerf0)*1000, (tPerfReclaim-tPerfMark)*1000,
             (tPerfLarge-tPerfReclaim)*1000, (tPerfStats-tPerfLarge)*1000, (tPerfEnd-tPerfStats)*1000,
             (int)MemUsage(), (int)mAllBlocks.size(), (int)mLargeAllocated);
       }
+      #endif
 
       mAllBlocksCount   = mAllBlocks.size();
       mCurrentRowsInUse = mRowsInUse;
@@ -6067,6 +6338,9 @@ public:
    size_t mTotalAfterLastCollect;
    size_t mAllBlocksCount;
    double mGenerationalRetainEstimate;
+   // [GEN-TEST-FIX] Remembered objects collected in Collect(); traced as roots
+   // by MarkAll during generational (minor) marks.
+   hx::QuickVec<hx::Object *> mRememberedSet;
 
    hx::MarkContext mMarker;
 

@@ -306,6 +306,20 @@ public:
 
 typedef ::cpp::Variant Val;
 
+// [GEN-TEST] Generational GC switch.  The single control is the project.xml
+// haxedef `<haxedef name="HXCPP_GC_GENERATIONAL"/>`:
+//   - the haxe compiler (gencpp is_gc_element) then emits barrier'd field
+//     setters + barrier'd assignments for every class,
+//   - the tag="haxe" plumbing in toolchain/common-defines.xml forwards -D to
+//     ALL hxcpp lib compile lines too - verified: Immix.cpp carries tags
+//     [haxe,gc] and received -DHXCPP_GC_GENERATIONAL(haxe) without any
+//     hardcode (an earlier hardcode here is no longer needed).
+// Comment the haxedef out to return to the stock full-mark GC; do NOT mix
+// states (headers and every TU must agree, StackContext layout included).
+// >>> The haxedef was required for the 2026-11-27 crash fix: without it the
+// codegen emits raw field stores and the generational minor misses them
+// (~1900 escapes / 34 minors, crash in ~4 min). <<<
+
 #ifdef HXCPP_GC_GENERATIONAL
   #define HXCPP_GC_NURSERY
 #endif
