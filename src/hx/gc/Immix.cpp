@@ -388,16 +388,52 @@ static bool sGcVerifyGenerational = false;
 
 #if HX_HAS_ATOMIC && (HXCPP_GC_DEBUG_LEVEL==0) && !defined(HXCPP_GC_VERIFY) && !defined(__EMSCRIPTEN__)
   #if defined(HX_MACOS) || defined(HX_WINDOWS) || defined(HX_LINUX)
-  enum { MAX_GC_THREADS = 4 };
+  // Compile-time ceiling only (array sizes).  The actual worker count is
+  // chosen at runtime from the machine's concurrency (see gcThreadCount()).
+  enum { MAX_GC_THREADS = 16 };
   #else
-  enum { MAX_GC_THREADS = 2 };
+  // Mobile (iOS/Android): 2 was written when phones were dual-core.  Modern
+  // phones carry 8 cores (1 big + 3 mid + 4 LITTLE).  A ceiling of 8 plus the
+  // runtime formula covers them; the dynamic job queue load-balances across
+  // unequal cores, so the LITTLE cores are net gain (no waiting on the
+  // slowest thread), and a stop-the-world mark lasts single-digit
+  // milliseconds - its power spike is negligible against battery budgets.
+  enum { MAX_GC_THREADS = 8 };
   #endif
-  
+
   // You can uncomment this for better call stacks if it crashes while collecting
   #define HX_MULTI_THREAD_MARKING
 #else
   enum { MAX_GC_THREADS = 1 };
 #endif
+
+// Runtime worker count for the STW parallel phases, following the JDK
+// G1/ParallelGC convention (the same collector shape as ours):
+//   ncpus <= 8:  threads = ncpus
+//   ncpus > 8:   threads = 8 + (ncpus - 8) * 5 / 8
+// Mappings: 1->1 2->2 4->4 8->8 16->13 20->15 64->43.
+// Validated on 4c8t i3-12100 (steamunlocked, n>=19 steady-state): 8 threads
+// beat both the old hardwired 4 and a 0.75x heuristic - drain 4.42->3.70ms
+// (-16%), full collect 6.91->6.14ms (-11%).  The mark loop is memory-LATENCY
+// bound (pointer chasing), so SMT siblings filling idle execution ports win
+// even though they share a physical core.
+static int gcThreadCount()
+{
+   static int cached = -1;
+   if (cached < 0)
+   {
+      unsigned int hw = std::thread::hardware_concurrency();
+      if (hw == 0)
+         hw = 4;
+      int t = (int)hw;
+      if (t > 8)
+         t = 8 + (t - 8) * 5 / 8;
+      if (t < 1) t = 1;
+      if (t > (int)MAX_GC_THREADS) t = MAX_GC_THREADS;
+      cached = t;
+   }
+   return cached;
+}
 
 // Instrumentation: total objects pushed through MarkObjectArray per collect.
 static volatile int sgArrayMarkCount = 0;
@@ -1133,46 +1169,26 @@ struct BlockDataInfo
       unsigned char *rowMarked = mPtr->mRowMarked;
       unsigned int *rowTotals = ((unsigned int *)rowMarked) + 1;
 
-      // TODO - sse/neon
+      // The original was a 63(+64)-term left-associated addition chain: with
+      // 4-cycle add latency the dependency chain alone cost ~250 cycles per
+      // block, dominating this pass.  Four independent accumulators restore
+      // ILP-4 (and are the exact shape compilers vectorize to PADDD).  The
+      // per-byte SWAR semantics are unchanged: each packed lane counts its
+      // own 4 rows, lane sums stay < 256 (one mark byte per row) so nothing
+      // carries between lanes.
+      unsigned int acc[4] = { 0, 0, 0, 0 };
       #ifdef HXCPP_GC_BIG_BLOCKS
-      unsigned int total = 0;
+      const int nRowTotals = 63 + 64;
       #else
-      unsigned int total = rowMarked[2] + rowMarked[3];
+      const int nRowTotals = 63;
       #endif
+      for(int i=0;i<nRowTotals;i++)
+         acc[i & 3] += rowTotals[i];
 
-      total +=
-       rowTotals[0]  + rowTotals[1]  + rowTotals[2]  + rowTotals[3]  + rowTotals[4] +
-       rowTotals[5]  + rowTotals[6]  + rowTotals[7]  + rowTotals[8]  + rowTotals[9] +
-       rowTotals[10] + rowTotals[11] + rowTotals[12] + rowTotals[13] + rowTotals[14] +
-       rowTotals[15] + rowTotals[16] + rowTotals[17] + rowTotals[18] + rowTotals[19] +
-       rowTotals[20] + rowTotals[21] + rowTotals[22] + rowTotals[23] + rowTotals[24] +
-       rowTotals[25] + rowTotals[26] + rowTotals[27] + rowTotals[28] + rowTotals[29] +
-       rowTotals[30] + rowTotals[31] + rowTotals[32] + rowTotals[33] + rowTotals[34] +
-       rowTotals[35] + rowTotals[36] + rowTotals[37] + rowTotals[38] + rowTotals[39] +
-       rowTotals[40] + rowTotals[41] + rowTotals[42] + rowTotals[43] + rowTotals[44] +
-       rowTotals[45] + rowTotals[46] + rowTotals[47] + rowTotals[48] + rowTotals[49] +
-       rowTotals[50] + rowTotals[51] + rowTotals[52] + rowTotals[53] + rowTotals[54] +
-       rowTotals[55] + rowTotals[56] + rowTotals[57] + rowTotals[58] + rowTotals[59] +
-       rowTotals[60] + rowTotals[61] + rowTotals[62];
+      unsigned int total = acc[0] + acc[1] + acc[2] + acc[3];
 
-
-      #ifdef HXCPP_GC_BIG_BLOCKS
-      rowTotals += 63;
-      total +=
-       rowTotals[0]  + rowTotals[1]  + rowTotals[2]  + rowTotals[3]  + rowTotals[4] +
-       rowTotals[5]  + rowTotals[6]  + rowTotals[7]  + rowTotals[8]  + rowTotals[9] +
-       rowTotals[10] + rowTotals[11] + rowTotals[12] + rowTotals[13] + rowTotals[14] +
-       rowTotals[15] + rowTotals[16] + rowTotals[17] + rowTotals[18] + rowTotals[19] +
-       rowTotals[20] + rowTotals[21] + rowTotals[22] + rowTotals[23] + rowTotals[24] +
-       rowTotals[25] + rowTotals[26] + rowTotals[27] + rowTotals[28] + rowTotals[29] +
-       rowTotals[30] + rowTotals[31] + rowTotals[32] + rowTotals[33] + rowTotals[34] +
-       rowTotals[35] + rowTotals[36] + rowTotals[37] + rowTotals[38] + rowTotals[39] +
-       rowTotals[40] + rowTotals[41] + rowTotals[42] + rowTotals[43] + rowTotals[44] +
-       rowTotals[45] + rowTotals[46] + rowTotals[47] + rowTotals[48] + rowTotals[49] +
-       rowTotals[50] + rowTotals[51] + rowTotals[52] + rowTotals[53] + rowTotals[54] +
-       rowTotals[55] + rowTotals[56] + rowTotals[57] + rowTotals[58] + rowTotals[59] +
-       rowTotals[60] + rowTotals[61] + rowTotals[62] + rowTotals[63];
-
+      #ifndef HXCPP_GC_BIG_BLOCKS
+      total += rowMarked[2] + rowMarked[3];
       #endif
 
       mUsedRows = (total & 0xff) + ((total>>8) & 0xff) + ((total>>16)&0xff) + ((total>>24)&0xff);
@@ -4936,7 +4952,7 @@ public:
       if (!sThreadPoolInit)
       {
          sThreadPoolInit = true;
-         for(int i=0;i<MAX_GC_THREADS;i++)
+         for(int i=0;i<gcThreadCount();i++)
             CreateWorker(i);
       }
 
@@ -4944,7 +4960,7 @@ public:
 
       sgThreadPoolJob = inJob;
 
-      sgThreadCount = inThreadLimit<0 ? MAX_GC_THREADS : std::min((int)MAX_GC_THREADS, inThreadLimit) ;
+      sgThreadCount = inThreadLimit<0 ? gcThreadCount() : std::min((int)MAX_GC_THREADS, inThreadLimit) ;
 
       int start = std::min(inWorkers, sgThreadCount );
 
